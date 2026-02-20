@@ -1,10 +1,10 @@
 # School-specific overrides for the shared app.
 # Copy this file to another repo and keep the same structure when you need to customize colors, logos, APIs, etc.
 school_config <- list(
-  team_code = "GCU",
+  team_code = "CNU",
   # Additional school-code markers used in TrackMan team columns (optional).
   # These are checked alongside team_code during allowed-player verification.
-  team_code_markers = c("GRA_CAN", "GRAND CANYON", "GCU"),
+  team_code_markers = c("CAR_EAG", "CNU"),
   # Player filters
   allowed_pitchers = c(
     "Lee, Aidan",
@@ -100,36 +100,7 @@ school_config <- list(
     "Nielsen, Jarret"
   ),
   allowed_campers = c(
-    "Bowman, Brock",
-    "Daniels, Tyke",
-    "Pearson, Blake",
-    "Rodriguez, Josiah",
-    "James, Brody",
-    "Nevarez, Matthew",
-    "Nunes, Nolan",
-    "Parks, Jaeden",
-    "Hill, Grant",
-    "McGinnis, Ayden",
-    "Morton, Ryker",
-    "McGuire, John",
-    "Willson, Brandon",
-    "Lauterbach, Camden",
-    "Turnquist, Dylan",
-    "Bournonville, Tanner",
-    "Evans, Lincoln",
-    "Gnirk, Will",
-    "Mann, Tyson",
-    "Neneman, Chase",
-    "Warmus, Joaquin",
-    "Kapadia, Taylor",
-    "Stoner, Timothy",
-    "Bergloff, Cameron",
-    "Hamm, Jacob",
-    "Hofmeister, Ben",
-    "Moo, Eriksen",
-    "Peltz, Zayden",
-    "Huff, Tyler",
-    "Moseman, Cody"
+
   ),
   colors = list(
     primary             = "#0d1224",   # deep navy used in the dark-mode radial gradient (gcu/app.R:17666-17674)
@@ -139,24 +110,20 @@ school_config <- list(
     background_secondary= "#e8ecf1"   # the matching secondary background tone
     
   ),
-  logo = "GCUlogo.png",
+  logo = "CNlogo.png",
   # Optional: Custom Reports page only (light mode + light PDF) alternate right-side logo.
   # If omitted or file is missing in /www, app automatically falls back to `logo`.
   custom_reports_light_logo = "GCUpurplelogo.png",
   coaches_emails = c(
-    "banni17@yahoo.com",
-    "adam.racine@aol.com",
-    "Njcbaseball08@gmail.com",
-    "ahalverson@pitchingcoachu.com",
-    "jdabisch05@gmail.com",
-    "jchipman@pitchingcoachu.com"
+    "Jwhite1@cn.edu",
+    "tgriffin@cn.edu"
   ),
   notes_api = list(
-    base_url = "https://script.google.com/macros/s/AKfycbwuftWhRZGV7f1lWFJnC5mBcxaXh7P7Xhlc7_Lvr5r6ZO_GYKbv6YxCp7B0AXsvCKY0/exec",
-    token = "GCUbaseball"
+    base_url = "https://script.google.com/macros/s/AKfycbwVUTGQybFrHjsyGGAwrzwAfTuibUA47g1C_Y0bdVB5LQJqObtpiR3oB9lKRYR2loiX/exec",
+    token = "CNUbaseball"
   ),
   extra = list(
-    school_name = "GCU",
+    school_name = "CNU",
     ftp_folder = "trackman",
     cloudinary_folder = "trackman"
   )
