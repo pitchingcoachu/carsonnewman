@@ -15,8 +15,8 @@ source("csv_filter_utils.R")
 source("video_map_helpers.R")
 # FTP credentials
 FTP_HOST <- "ftp.trackmanbaseball.com"
-FTP_USER <- "GrandCanyon"
-FTP_PASS <- "F42Y6LiLGS"
+FTP_USER <- "CarsonNewman"
+FTP_PASS <- "A9HnS2UAro"
 # When passwords contain special characters like @ or %, don't embed them in the URL.
 FTP_USERPWD <- paste0(FTP_USER, ":", FTP_PASS)
 
