@@ -3540,3 +3540,29 @@
 20260220-WoernerField-2_unverified.csv
 # Auto-pruned non-team data
 20260220-YoungMemorialField-1_unverified.csv
+# Auto-pruned non-team data
+20260220-CaesarUyesaka-1_unverified.csv
+# Auto-pruned non-team data
+20260220-CondronBallpark-1_unverified.csv
+# Auto-pruned non-team data
+20260220-FAUBaseballStadium-2_unverified.csv
+# Auto-pruned non-team data
+20260220-GulfCoastState-1_unverified.csv
+# Auto-pruned non-team data
+20260220-MelchingFielda-2_unverified.csv
+# Auto-pruned non-team data
+20260220-MercerUniversity-1_unverified.csv
+# Auto-pruned non-team data
+20260220-Olsen-1_unverified.csv
+# Auto-pruned non-team data
+20260220-Olsen-2_unverified.csv
+# Auto-pruned non-team data
+20260220-RiddlePaceField-1_unverified.csv
+# Auto-pruned non-team data
+20260220-RockwellField-1_unverified.csv
+# Auto-pruned non-team data
+20260220-UofSouthCarolina-2_unverified.csv
+# Auto-pruned non-team data
+20260220-USFBaseballStadium-1_unverified.csv
+# Auto-pruned non-team data
+20260220-WilliamCarey-2_unverified.csv
