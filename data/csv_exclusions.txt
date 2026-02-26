@@ -5674,3 +5674,35 @@
 20260225-WestVirginia-1.csv
 # Auto-pruned non-team data
 20260225-WoernerField-1.csv
+# Auto-pruned non-team data
+20260207-PaulDemieMainieriField-1.csv
+# Auto-pruned non-team data
+20260207-TedABroerStadium-1.csv
+# Auto-pruned non-team data
+20260207-TedABroerStadium-2.csv
+# Auto-pruned non-team data
+20260207-WilliamCarey-1.csv
+# Auto-pruned non-team data
+20260214-UofMontevallo-2.csv
+# Auto-pruned non-team data
+20260215-TIGERBALLPARK-1.csv
+# Auto-pruned non-team data
+20260219-BowiesBallpark-1.csv
+# Auto-pruned non-team data
+20260219-WinterholterField-1.csv
+# Auto-pruned non-team data
+20260220-PaulDemieMainieriField-1.csv
+# Auto-pruned non-team data
+20260220-SullivanField-3_unverified.csv
+# Auto-pruned non-team data
+20260220-SullivanField-3.csv
+# Auto-pruned non-team data
+20260220-TedABroerStadium-2.csv
+# Auto-pruned non-team data
+20260221-GeorgeFox-2.csv
+# Auto-pruned non-team data
+20260221-SullivanField-2_unverified.csv
+# Auto-pruned non-team data
+20260221-SullivanField-2.csv
+# Auto-pruned non-team data
+20260221-WilliamCarey-2.csv
