@@ -5732,3 +5732,69 @@
 20260226-GoldenWestCollege-1_unverified.csv
 # Auto-pruned non-team data
 20260226-RonaldGallagherStad-1_unverified.csv
+# Auto-pruned non-team data
+20260213-PointLomaNazarene-Private-1.csv
+# Auto-pruned non-team data
+20260213-TIGERBALLPARK-Private-1.csv
+# Auto-pruned non-team data
+20260214-PointLomaNazarene-Private-1.csv
+# Auto-pruned non-team data
+20260216-RodenField-1_unverified.csv
+# Auto-pruned non-team data
+20260217-RonChrisStad-Private-1.csv
+# Auto-pruned non-team data
+20260218-PointLomaNazarene-Private-1.csv
+# Auto-pruned non-team data
+20260219-PointLomaNazarene-Private-1.csv
+# Auto-pruned non-team data
+20260220-BowiesBallpark-1.csv
+# Auto-pruned non-team data
+20260220-BowiesBallpark-2.csv
+# Auto-pruned non-team data
+20260220-CatholicUniversity-1.csv
+# Auto-pruned non-team data
+20260220-JohnALogan-1.csv
+# Auto-pruned non-team data
+20260220-JohnALogan-2.csv
+# Auto-pruned non-team data
+20260221-AngelinaCollege-1.csv
+# Auto-pruned non-team data
+20260221-AngelinaCollege-2.csv
+# Auto-pruned non-team data
+20260221-BowiesBallpark-1.csv
+# Auto-pruned non-team data
+20260221-HammondStadium-Private-2.csv
+# Auto-pruned non-team data
+20260222-HammondStadium-Private-2.csv
+# Auto-pruned non-team data
+20260226-BaggettStadium-1.csv
+# Auto-pruned non-team data
+20260226-BenedettiDiamond-1.csv
+# Auto-pruned non-team data
+20260226-BlairField-1.csv
+# Auto-pruned non-team data
+20260226-DallasBaptist-1.csv
+# Auto-pruned non-team data
+20260226-GoldenWestCollege-1.csv
+# Auto-pruned non-team data
+20260226-JohnAltobelliPark-1.csv
+# Auto-pruned non-team data
+20260226-PershingPark-1.csv
+# Auto-pruned non-team data
+20260226-WichitaState-1.csv
+# Auto-pruned non-team data
+20260227-Arlington-1_unverified.csv
+# Auto-pruned non-team data
+20260227-BushStadium-1_unverified.csv
+# Auto-pruned non-team data
+20260227-HarlanRogersSportsComplex-1_unverified.csv
+# Auto-pruned non-team data
+20260227-JohnALogan-1_unverified.csv
+# Auto-pruned non-team data
+20260227-PittFieldUOR-1_unverified.csv
+# Auto-pruned non-team data
+20260227-RonaldGallagherStad-1_unverified.csv
+# Auto-pruned non-team data
+20260227-SouthernIdaho-1_unverified.csv
+# Auto-pruned non-team data
+20260227-WinterholterField-1_unverified.csv
