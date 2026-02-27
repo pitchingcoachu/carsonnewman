@@ -5706,3 +5706,29 @@
 20260221-SullivanField-2.csv
 # Auto-pruned non-team data
 20260221-WilliamCarey-2.csv
+# Auto-pruned non-team data
+20260220-CypressCollege-1_unverified.csv
+# Auto-pruned non-team data
+20260220-CypressCollege-3_unverified.csv
+# Auto-pruned non-team data
+20260222-PershingPark-1_unverified.csv
+# Auto-pruned non-team data
+20260226-700-HughAdamsPark-1_unverified.csv
+# Auto-pruned non-team data
+20260226-BenedettiDiamond-1_unverified.csv
+# Auto-pruned non-team data
+20260226-BlairField-1_unverified.csv
+# Auto-pruned non-team data
+20260226-DallasBaptist-1_unverified.csv
+# Auto-pruned non-team data
+20260226-JohnAltobelliPark-1_unverified.csv
+# Auto-pruned non-team data
+20260226-PershingPark-1_unverified.csv
+# Auto-pruned non-team data
+20260226-WichitaState-1_unverified.csv
+# Auto-pruned non-team data
+20260226-BaggettStadium-1_unverified.csv
+# Auto-pruned non-team data
+20260226-GoldenWestCollege-1_unverified.csv
+# Auto-pruned non-team data
+20260226-RonaldGallagherStad-1_unverified.csv
