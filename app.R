@@ -124,6 +124,41 @@ ZONE_RIGHT <- 0.83
 ZONE_BOTTOM <- 1.5
 ZONE_TOP <- 3.5
 
+zone_nine_square_layers <- function(color = "black", linewidth = 0.5, alpha = 1) {
+  dx <- (ZONE_RIGHT - ZONE_LEFT) / 3
+  dy <- (ZONE_TOP - ZONE_BOTTOM) / 3
+  grid_vertical <- data.frame(
+    x = c(ZONE_LEFT + dx, ZONE_LEFT + 2 * dx),
+    xend = c(ZONE_LEFT + dx, ZONE_LEFT + 2 * dx),
+    y = ZONE_BOTTOM,
+    yend = ZONE_TOP
+  )
+  grid_horizontal <- data.frame(
+    x = ZONE_LEFT,
+    xend = ZONE_RIGHT,
+    y = c(ZONE_BOTTOM + dy, ZONE_BOTTOM + 2 * dy),
+    yend = c(ZONE_BOTTOM + dy, ZONE_BOTTOM + 2 * dy)
+  )
+  list(
+    geom_segment(
+      data = grid_vertical,
+      aes(x = x, xend = xend, y = y, yend = yend),
+      inherit.aes = FALSE,
+      color = color,
+      linewidth = linewidth,
+      alpha = alpha
+    ),
+    geom_segment(
+      data = grid_horizontal,
+      aes(x = x, xend = xend, y = y, yend = yend),
+      inherit.aes = FALSE,
+      color = color,
+      linewidth = linewidth,
+      alpha = alpha
+    )
+  )
+}
+
 # Frequency (keep multi-color)
 heat_pal_freq <- function(n = HEAT_BINS) colorRampPalette(
   c("white","pink","red")
@@ -854,6 +889,7 @@ library(RSQLite)  # for SQLite database
 
 # Source helper for mapping uploads
 source("video_map_helpers.R")
+source("pitch_data_service.R")
 
 # Configure Cloudinary (recommended simple host for images/videos)
 # Create a free account, make an *unsigned upload preset*, then set these:
@@ -1055,6 +1091,64 @@ mod_db_connect <- function() {
   con
 }
 
+db_error_message <- function(x, default = "connection returned NULL") {
+  if (inherits(x, "condition")) return(conditionMessage(x))
+  if (is.character(x) && length(x) >= 1L && nzchar(x[[1]])) return(x[[1]])
+  default
+}
+
+db_get_query_safe <- function(con, sql, params = NULL) {
+  tryCatch(
+    {
+      if (is.null(params)) {
+        DBI::dbGetQuery(con, sql)
+      } else {
+        DBI::dbGetQuery(con, sql, params = params)
+      }
+    },
+    error = function(e1) {
+      msg <- conditionMessage(e1)
+      recoverable <- grepl(
+        "unnamed prepared statement does not exist|query needs to be bound before fetching|Failed to retrieve query result metadata|Query requires [0-9]+ params; [0-9]+ supplied|bind message supplies [0-9]+ parameters, but prepared statement .* requires [0-9]+",
+        msg,
+        ignore.case = TRUE
+      )
+      if (!recoverable) stop(e1)
+      if (is.null(params)) {
+        DBI::dbGetQuery(con, sql, immediate = TRUE)
+      } else {
+        DBI::dbGetQuery(con, sql, params = params, immediate = TRUE)
+      }
+    }
+  )
+}
+
+db_execute_safe <- function(con, sql, params = NULL) {
+  tryCatch(
+    {
+      if (is.null(params)) {
+        DBI::dbExecute(con, sql)
+      } else {
+        DBI::dbExecute(con, sql, params = params)
+      }
+    },
+    error = function(e1) {
+      msg <- conditionMessage(e1)
+      recoverable <- grepl(
+        "unnamed prepared statement does not exist|query needs to be bound before fetching|Failed to retrieve query result metadata|Query requires [0-9]+ params; [0-9]+ supplied|bind message supplies [0-9]+ parameters, but prepared statement .* requires [0-9]+",
+        msg,
+        ignore.case = TRUE
+      )
+      if (!recoverable) stop(e1)
+      if (is.null(params)) {
+        DBI::dbExecute(con, sql, immediate = TRUE)
+      } else {
+        DBI::dbExecute(con, sql, params = params, immediate = TRUE)
+      }
+    }
+  )
+}
+
 pitch_mod_table_name <- function() {
   tbl <- Sys.getenv("PITCH_MOD_DB_TABLE", "modifications")
   tbl <- gsub("[^A-Za-z0-9_]", "_", tbl, perl = TRUE)
@@ -1164,6 +1258,7 @@ state_backend <- function() {
 }
 
 state_backend_cfg <- state_backend()
+message("State backend selected: ", state_backend_cfg$type)
 
 state_db_connect <- function() {
   state_backend_cfg$connect()
@@ -1382,9 +1477,10 @@ compute_pitch_key <- function(df) {
   }
   vapply(seq_len(nrow(df)), function(i) {
     row <- df[i, , drop = FALSE]
+    row_date <- tryCatch(parse_date_flex(row$Date), error = function(...) as.Date(NA))
     parts <- c(
       safe_col(row, "Pitcher"),
-      safe_chr(as.Date(row$Date)),
+      safe_chr(row_date),
       safe_col(row, "SessionType"),
       safe_col(row, "Batter"),
       safe_col(row, "PitchCall"),
@@ -1406,6 +1502,71 @@ compute_pitch_key <- function(df) {
   }, character(1))
 }
 
+compute_pitch_key_legacy_hash <- function(df) {
+  if (!nrow(df)) return(character(0))
+  safe_chr <- function(x) {
+    out <- tryCatch(as.character(x), warning = function(...) "", error = function(...) "")
+    out[is.na(out)] <- ""
+    trimws(out)
+  }
+  safe_num_chr <- function(x) {
+    val <- suppressWarnings(as.numeric(x))
+    out <- ifelse(is.finite(val), sprintf("%.3f", round(val, 3)), "")
+    out[is.na(out)] <- ""
+    out
+  }
+  paste_parts <- paste(
+    safe_chr(df$Pitcher %||% ""),
+    safe_chr(as.Date(df$Date)),
+    safe_chr(df$SessionType %||% ""),
+    safe_chr(df$Batter %||% ""),
+    safe_chr(df$PitchCall %||% ""),
+    safe_chr(df$PlayResult %||% ""),
+    safe_chr(df$TaggedPitchType %||% ""),
+    safe_chr(df$Inning %||% ""),
+    safe_chr(df$Balls %||% ""),
+    safe_chr(df$Strikes %||% ""),
+    safe_num_chr(df$RelSpeed %||% NA),
+    safe_num_chr(df$InducedVertBreak %||% NA),
+    safe_num_chr(df$HorzBreak %||% NA),
+    safe_num_chr(df$Extension %||% NA),
+    safe_num_chr(df$VertApprAngle %||% NA),
+    safe_num_chr(df$HorzApprAngle %||% NA),
+    safe_num_chr(df$PlateLocSide %||% NA),
+    safe_num_chr(df$PlateLocHeight %||% NA),
+    sep = "|"
+  )
+  vapply(paste_parts, function(x) digest::digest(x, algo = "xxhash64", serialize = FALSE), character(1))
+}
+
+compute_pitch_key_service_hash <- function(df) {
+  if (!nrow(df)) return(character(0))
+  safe_chr <- function(x) {
+    out <- tryCatch(as.character(x), warning = function(...) "", error = function(...) "")
+    out[is.na(out)] <- ""
+    trimws(out)
+  }
+  paste_parts <- paste(
+    safe_chr(df$Date %||% ""),
+    safe_chr(df$Pitcher %||% ""),
+    safe_chr(df$Batter %||% ""),
+    safe_chr(df$PlayID %||% ""),
+    safe_chr(df$PitchCall %||% ""),
+    safe_chr(df$PlayResult %||% ""),
+    safe_chr(df$TaggedPitchType %||% ""),
+    safe_chr(df$Balls %||% ""),
+    safe_chr(df$Strikes %||% ""),
+    safe_chr(df$RelSpeed %||% ""),
+    safe_chr(df$InducedVertBreak %||% ""),
+    safe_chr(df$HorzBreak %||% ""),
+    safe_chr(df$Extension %||% ""),
+    safe_chr(df$PlateLocSide %||% ""),
+    safe_chr(df$PlateLocHeight %||% ""),
+    sep = "|"
+  )
+  vapply(paste_parts, function(x) digest::digest(x, algo = "xxhash64", serialize = FALSE), character(1))
+}
+
 ensure_pitch_keys <- function(df) {
   if (!nrow(df)) {
     if (!"PitchKey" %in% names(df)) df$PitchKey <- character(0)
@@ -1423,40 +1584,65 @@ ensure_pitch_keys <- function(df) {
   df
 }
 
-deduplicate_pitch_rows <- function(df) {
+deduplicate_pitch_rows <- function(df, fast = FALSE) {
   if (!nrow(df)) return(df)
-  df <- ensure_pitch_keys(df)
   if (!"PitchKey" %in% names(df)) return(df)
   if (!any(!is.na(df$PitchKey) & nzchar(as.character(df$PitchKey)))) return(df)
+  key_chr <- as.character(df$PitchKey)
+  key_valid <- !is.na(key_chr) & nzchar(key_chr)
+  # Fast-path: skip expensive grouped dedupe when keys are already unique.
+  if (!anyDuplicated(key_chr[key_valid])) return(df)
 
-  # Keep the most complete row per PitchKey in case duplicate files differ slightly.
-  present_score <- function(x) {
-    if (is.numeric(x)) return(as.integer(is.finite(x)))
-    as.integer(!is.na(x) & nzchar(trimws(as.character(x))))
+  # Keep first occurrence per PitchKey; vastly faster than grouped scoring for large tables.
+  keep <- !key_valid | !duplicated(key_chr)
+  df[keep, , drop = FALSE]
+}
+
+mod_datetime_to_numeric <- function(x) {
+  if (is.null(x) || !length(x)) return(numeric(0))
+
+  if (is.list(x)) {
+    x <- unlist(x, recursive = TRUE, use.names = FALSE)
   }
 
-  score_cols <- c(
-    "PlayID", "PitchCall", "PlayResult", "TaggedPitchType",
-    "RelSpeed", "InducedVertBreak", "HorzBreak", "PlateLocSide", "PlateLocHeight",
-    "VideoClip", "VideoClip2", "VideoClip3"
-  )
-  score_cols <- intersect(score_cols, names(df))
-  if (!length(score_cols)) score_cols <- names(df)
-
-  df$.row_id <- seq_len(nrow(df))
-  df$.dedupe_score <- 0L
-  for (col in score_cols) {
-    df$.dedupe_score <- df$.dedupe_score + present_score(df[[col]])
+  if (inherits(x, "POSIXt")) {
+    num <- suppressWarnings(as.numeric(x))
+    num[!is.finite(num)] <- NA_real_
+    return(num)
   }
 
-  out <- df %>%
-    dplyr::group_by(PitchKey) %>%
-    dplyr::arrange(dplyr::desc(.dedupe_score), .row_id, .by_group = TRUE) %>%
-    dplyr::slice_head(n = 1) %>%
-    dplyr::ungroup() %>%
-    dplyr::arrange(.row_id) %>%
-    dplyr::select(-.row_id, -.dedupe_score)
+  num_raw <- suppressWarnings(as.numeric(x))
+  has_num <- is.finite(num_raw)
+  out <- rep(NA_real_, length(num_raw))
+  if (any(has_num)) {
+    vals <- num_raw[has_num]
+    vals[vals > 1e12] <- vals[vals > 1e12] / 1000
+    out[has_num] <- vals
+  }
 
+  ch <- trimws(as.character(x))
+  ch[ch %in% c("", "NA", "NaN", "NULL", "null")] <- NA_character_
+  need_parse <- !is.na(ch) & !has_num
+  if (any(need_parse)) {
+    parsed <- suppressWarnings(as.POSIXct(
+      ch[need_parse],
+      tz = "UTC",
+      tryFormats = c(
+        "%Y-%m-%d %H:%M:%OS",
+        "%Y-%m-%d %H:%M:%S",
+        "%Y-%m-%dT%H:%M:%OSZ",
+        "%Y-%m-%dT%H:%M:%S%z",
+        "%m/%d/%Y %H:%M:%S",
+        "%m/%d/%y %H:%M:%S",
+        "%Y-%m-%d",
+        "%m/%d/%Y",
+        "%m/%d/%y"
+      )
+    ))
+    out[need_parse] <- suppressWarnings(as.numeric(parsed))
+  }
+
+  out[!is.finite(out)] <- NA_real_
   out
 }
 
@@ -1503,7 +1689,7 @@ refresh_missing_pitch_keys <- function(con, mods_df, base_data) {
     tbl <- as.character(pitch_mod_table_clause(con))
     for (idx in newly_filled) {
       query <- sprintf("UPDATE %s SET pitch_key = ? WHERE id = ?", tbl)
-      try(dbExecute(con, query, list(mods_with_keys$pitch_key[idx], mods_with_keys$id[idx])), silent = TRUE)
+      try(db_execute_safe(con, query, params = list(mods_with_keys$pitch_key[idx], mods_with_keys$id[idx])), silent = TRUE)
     }
   }
   mods_with_keys
@@ -1549,8 +1735,8 @@ deduplicate_mod_rows <- function(mods_df) {
   fallback <- mod_row_signature(mods_df)
   mods_df$.dedupe_group <- ifelse(keyed, paste0("k:", key), paste0("f:", fallback))
 
-  mod_ts <- suppressWarnings(as.numeric(as.POSIXct(mods_df$modified_at, tz = "UTC")))
-  created_ts <- suppressWarnings(as.numeric(as.POSIXct(mods_df$created_at, tz = "UTC")))
+  mod_ts <- mod_datetime_to_numeric(mods_df$modified_at)
+  created_ts <- mod_datetime_to_numeric(mods_df$created_at)
   rank_ts <- mod_ts
   missing_rank <- !is.finite(rank_ts)
   rank_ts[missing_rank] <- created_ts[missing_rank]
@@ -1575,7 +1761,7 @@ write_modifications_snapshot <- function(con) {
   # Get all modifications from database
   tbl <- as.character(pitch_mod_table_clause(con))
   ns <- pitch_mod_namespace_clause(con)
-  mods <- try(dbGetQuery(con, sprintf("SELECT * FROM %s WHERE namespace = %s ORDER BY created_at", tbl, ns)), silent = TRUE)
+  mods <- try(db_get_query_safe(con, sprintf("SELECT * FROM %s WHERE namespace = %s ORDER BY created_at", tbl, ns)), silent = TRUE)
   if (inherits(mods, "try-error") || !nrow(mods)) return()
   if (!"is_deleted" %in% names(mods)) mods$is_deleted <- 0
 
@@ -1625,7 +1811,7 @@ import_modifications_from_export <- function(con, base_data) {
   # Get existing modifications from database
   tbl <- as.character(pitch_mod_table_clause(con))
   ns_clause <- pitch_mod_namespace_clause(con)
-  existing <- try(dbGetQuery(con, sprintf("SELECT pitcher, date, rel_speed, horz_break, induced_vert_break, new_pitch_type, new_pitcher, is_deleted, pitch_key FROM %s WHERE namespace = %s", tbl, ns_clause)), silent = TRUE)
+  existing <- try(db_get_query_safe(con, sprintf("SELECT pitcher, date, rel_speed, horz_break, induced_vert_break, new_pitch_type, new_pitcher, is_deleted, pitch_key FROM %s WHERE namespace = %s", tbl, ns_clause)), silent = TRUE)
 
   if (inherits(existing, "try-error") || !nrow(existing)) {
     new_rows <- mods_csv
@@ -1749,7 +1935,7 @@ init_modifications_db <- function() {
 
   con <- mod_db_connect()
   if (inherits(con, "error") || is.null(con)) {
-    warning(sprintf("Could not connect to pitch modifications backend (%s)", conditionMessage(con)))
+    warning(sprintf("Could not connect to pitch modifications backend (%s)", db_error_message(con)))
     return(invisible(NULL))
   }
   on.exit(dbDisconnect(con), add = TRUE)
@@ -1799,26 +1985,26 @@ init_modifications_db <- function() {
       )
       ", tbl_clause, ns_default)
     }
-    dbExecute(con, table_sql)
-    dbExecute(con, sprintf("CREATE INDEX IF NOT EXISTS %s ON %s (pitcher, date, rel_speed, horz_break, induced_vert_break)", idx_lookup, tbl_clause))
-    dbExecute(con, sprintf("CREATE INDEX IF NOT EXISTS %s ON %s (pitch_key)", idx_key, tbl_clause))
+    db_execute_safe(con, table_sql)
+    db_execute_safe(con, sprintf("CREATE INDEX IF NOT EXISTS %s ON %s (pitcher, date, rel_speed, horz_break, induced_vert_break)", idx_lookup, tbl_clause))
+    db_execute_safe(con, sprintf("CREATE INDEX IF NOT EXISTS %s ON %s (pitch_key)", idx_key, tbl_clause))
     cols <- try(dbListFields(con, pitch_mod_table_name()), silent = TRUE)
     if (!inherits(cols, "try-error")) {
       if (!"new_pitcher" %in% cols) {
-        try(dbExecute(con, sprintf("ALTER TABLE %s ADD COLUMN new_pitcher TEXT", tbl_clause)), silent = TRUE)
+        try(db_execute_safe(con, sprintf("ALTER TABLE %s ADD COLUMN new_pitcher TEXT", tbl_clause)), silent = TRUE)
         cols <- try(dbListFields(con, pitch_mod_table_name()), silent = TRUE)
       }
       if (!"namespace" %in% cols) {
-        try(dbExecute(con, sprintf("ALTER TABLE %s ADD COLUMN namespace TEXT NOT NULL DEFAULT %s", tbl_clause, ns_default)), silent = TRUE)
+        try(db_execute_safe(con, sprintf("ALTER TABLE %s ADD COLUMN namespace TEXT NOT NULL DEFAULT %s", tbl_clause, ns_default)), silent = TRUE)
       }
       if (!"is_deleted" %in% cols) {
-        try(dbExecute(con, sprintf("ALTER TABLE %s ADD COLUMN is_deleted INTEGER NOT NULL DEFAULT 0", tbl_clause)), silent = TRUE)
+        try(db_execute_safe(con, sprintf("ALTER TABLE %s ADD COLUMN is_deleted INTEGER NOT NULL DEFAULT 0", tbl_clause)), silent = TRUE)
       }
     }
     base_data <- get0("pitch_data_pitching", ifnotfound = NULL)
     import_modifications_from_export(con, base_data)
     ns_clause <- pitch_mod_namespace_clause(con)
-    mods <- try(dbGetQuery(con, sprintf("SELECT * FROM %s WHERE namespace = %s ORDER BY created_at", tbl_clause, ns_clause)), silent = TRUE)
+    mods <- try(db_get_query_safe(con, sprintf("SELECT * FROM %s WHERE namespace = %s ORDER BY created_at", tbl_clause, ns_clause)), silent = TRUE)
     db_count <- if (inherits(mods, "try-error")) NA_integer_ else nrow(mods)
     message(sprintf("Pitch modifications backend (%s) rows: %s", backend_label, db_count))
 
@@ -1828,12 +2014,12 @@ init_modifications_db <- function() {
         message(sprintf("Deduplicating stored modifications (%d -> %d rows)", nrow(mods), nrow(mods_dedup)))
         tryCatch({
           dbBegin(con)
-          dbExecute(con, sprintf("DELETE FROM %s WHERE namespace = %s", tbl_clause, ns_clause))
+          db_execute_safe(con, sprintf("DELETE FROM %s WHERE namespace = %s", tbl_clause, ns_clause))
           mods_write <- mods_dedup
           mods_write$id <- NULL
           dbWriteTable(con, pitch_mod_table_name(), mods_write, append = TRUE)
           dbCommit(con)
-          mods <- try(dbGetQuery(con, sprintf("SELECT * FROM %s WHERE namespace = %s ORDER BY created_at", tbl_clause, ns_clause)), silent = TRUE)
+          mods <- try(db_get_query_safe(con, sprintf("SELECT * FROM %s WHERE namespace = %s ORDER BY created_at", tbl_clause, ns_clause)), silent = TRUE)
         }, error = function(e) {
           try(dbRollback(con), silent = TRUE)
           warning(sprintf("Could not deduplicate stored modifications: %s", conditionMessage(e)))
@@ -1865,7 +2051,7 @@ init_modifications_db <- function() {
       if (!is.null(csv_info$path) && is.finite(csv_info$n) && csv_info$n > db_count) {
         message(sprintf("Rebuilding modifications backend from %s (%d -> %d rows)", 
                         csv_info$path, db_count, csv_info$n))
-        try(dbExecute(con, sprintf("DELETE FROM %s WHERE namespace = %s", tbl_clause, ns_clause)), silent = TRUE)
+        try(db_execute_safe(con, sprintf("DELETE FROM %s WHERE namespace = %s", tbl_clause, ns_clause)), silent = TRUE)
         mods_csv <- try(readr::read_csv(csv_info$path, show_col_types = FALSE), silent = TRUE)
         if (!inherits(mods_csv, "try-error") && nrow(mods_csv)) {
           mods_csv <- as.data.frame(mods_csv, stringsAsFactors = FALSE, check.names = FALSE)
@@ -1895,7 +2081,7 @@ init_modifications_db <- function() {
           if ("created_at" %in% names(new_rows)) new_rows$created_at <- normalize_mod_date_column(new_rows$created_at, is_datetime = TRUE)
           try(dbWriteTable(con, pitch_mod_table_name(), new_rows, append = TRUE), silent = TRUE)
         }
-        mods <- try(dbGetQuery(con, sprintf("SELECT * FROM %s WHERE namespace = %s ORDER BY created_at", tbl_clause, ns_clause)), silent = TRUE)
+        mods <- try(db_get_query_safe(con, sprintf("SELECT * FROM %s WHERE namespace = %s ORDER BY created_at", tbl_clause, ns_clause)), silent = TRUE)
         if (!inherits(mods, "try-error")) {
           refresh_missing_pitch_keys(con, mods, base_data)
           write_modifications_snapshot(con)
@@ -1914,7 +2100,7 @@ save_pitch_modifications_db <- function(selected_pitches, new_type, new_pitcher 
   init_modifications_db()
   con <- mod_db_connect()
   if (inherits(con, "error") || is.null(con)) {
-    return(list(success = FALSE, error = conditionMessage(con)))
+    return(list(success = FALSE, error = db_error_message(con)))
   }
   on.exit(dbDisconnect(con), add = TRUE)
 
@@ -1974,7 +2160,7 @@ save_pitch_modifications_db <- function(selected_pitches, new_type, new_pitcher 
     for (i in seq_len(nrow(new_mods))) {
       key_literal <- DBI::dbQuoteString(con, new_mods$pitch_key[i])
       delete_sql <- sprintf("DELETE FROM %s WHERE pitch_key = %s AND namespace = %s", tbl_clause, key_literal, ns_clause)
-      dbExecute(con, delete_sql)
+      db_execute_safe(con, delete_sql)
     }
     dbWriteTable(con, pitch_mod_table_name(), new_mods, append = TRUE)
     dbCommit(con)
@@ -2012,13 +2198,8 @@ mod_memo <- function(mods_df) {
   }
   safe_dt <- function(x) {
     tryCatch({
-      v <- as.character(x)
-      out <- suppressWarnings(lubridate::parse_date_time(
-        v,
-        orders = c("ymd HMS", "mdy HMS", "dmy HMS", "ymd HM", "mdy HM", "dmy HM", "ymd", "mdy", "dmy"),
-        tz = "UTC"
-      ))
-      as.POSIXct(out, tz = "UTC")
+      num <- mod_datetime_to_numeric(x)
+      as.POSIXct(num, origin = "1970-01-01", tz = "UTC")
     }, error = function(...) as.POSIXct(NA))
   }
   mods_df$date <- safe_date(mods_df$date)
@@ -2041,14 +2222,14 @@ load_pitch_modifications_db <- function(pitch_data, verbose = TRUE) {
     init_modifications_db()
     con <- mod_db_connect()
     if (inherits(con, "error") || is.null(con)) {
-      warning(sprintf("Could not open pitch modifications backend (%s)", conditionMessage(con)))
+      warning(sprintf("Could not open pitch modifications backend (%s)", db_error_message(con)))
       return(fallback_result)
     }
     on.exit(dbDisconnect(con), add = TRUE)
 
     tbl_clause <- as.character(pitch_mod_table_clause(con))
     ns_clause <- pitch_mod_namespace_clause(con)
-    mods <- try(dbGetQuery(con, sprintf("SELECT * FROM %s WHERE namespace = %s ORDER BY created_at", tbl_clause, ns_clause)), silent = TRUE)
+    mods <- try(db_get_query_safe(con, sprintf("SELECT * FROM %s WHERE namespace = %s ORDER BY created_at", tbl_clause, ns_clause)), silent = TRUE)
     if (inherits(mods, "error") || !nrow(mods)) {
       return(list(
         data = ensure_pitch_keys(pitch_data) %>% mutate(original_row_id = row_number()),
@@ -2075,6 +2256,14 @@ load_pitch_modifications_db <- function(pitch_data, verbose = TRUE) {
 
     temp_data <- base_data %>% mutate(original_row_id = row_number())
     deleted_mask <- logical(nrow(temp_data))
+    temp_key <- as.character(temp_data$PitchKey %||% "")
+    temp_pitch_uid <- as.character(temp_data$PitchUID %||% "")
+    temp_pitch_guid <- as.character(temp_data$PitchGuid %||% "")
+    temp_pitch_id <- as.character(temp_data$PitchID %||% "")
+    temp_play_id <- as.character(temp_data$PlayID %||% "")
+    temp_legacy_hash <- tryCatch(compute_pitch_key_legacy_hash(temp_data), error = function(e) rep("", nrow(temp_data)))
+    temp_service_hash <- tryCatch(compute_pitch_key_service_hash(temp_data), error = function(e) rep("", nrow(temp_data)))
+    temp_date_norm <- as.character(parse_date_flex(temp_data$Date))
 
     modifications_applied <- 0
     modifications_not_found <- 0
@@ -2094,14 +2283,27 @@ load_pitch_modifications_db <- function(pitch_data, verbose = TRUE) {
 
     for (i in seq_len(nrow(mods))) {
       mod <- mods[i, ]
+      mod_key <- trimws(as.character(mod$pitch_key %||% ""))
+      mod_date_norm <- as.character(parse_date_flex(mod$date))
       match_idx <- integer(0)
-      if ("PitchKey" %in% names(temp_data) && !is.na(mod$pitch_key) && nzchar(mod$pitch_key)) {
-        match_idx <- which(temp_data$PitchKey == mod$pitch_key)
+      if ("PitchKey" %in% names(temp_data) && nzchar(mod_key)) {
+        match_idx <- which(temp_key == mod_key)
+      }
+      if (!length(match_idx) && nzchar(mod_key)) {
+        # Handle key-shape drift across loaders by checking raw IDs + legacy hash variants.
+        match_idx <- which(
+          temp_pitch_uid == mod_key |
+            temp_pitch_guid == mod_key |
+            temp_pitch_id == mod_key |
+            temp_play_id == mod_key |
+            temp_legacy_hash == mod_key |
+            temp_service_hash == mod_key
+        )
       }
       if (!length(match_idx)) {
         match_idx <- which(
           temp_data$Pitcher == mod$pitcher &
-            temp_data$Date == mod$date &
+            temp_date_norm == mod_date_norm &
             abs(temp_data$RelSpeed - mod$rel_speed) < 0.1 &
             abs(temp_data$HorzBreak - mod$horz_break) < 0.1 &
             abs(temp_data$InducedVertBreak - mod$induced_vert_break) < 0.1
@@ -2110,7 +2312,7 @@ load_pitch_modifications_db <- function(pitch_data, verbose = TRUE) {
       if (length(match_idx) == 0) {
         match_idx <- which(
           temp_data$Pitcher == mod$pitcher &
-            temp_data$Date == mod$date &
+            temp_date_norm == mod_date_norm &
             abs(temp_data$RelSpeed - mod$rel_speed) < 0.5
         )
       }
@@ -2243,15 +2445,15 @@ get_modification_stats <- function() {
   tryCatch({
     tbl <- as.character(pitch_mod_table_clause(con))
     ns_clause <- pitch_mod_namespace_clause(con)
-    total <- dbGetQuery(con, sprintf("SELECT COUNT(*) as count FROM %s WHERE namespace = %s", tbl, ns_clause))$count
-    by_player <- dbGetQuery(con, sprintf("
+    total <- db_get_query_safe(con, sprintf("SELECT COUNT(*) as count FROM %s WHERE namespace = %s", tbl, ns_clause))$count
+    by_player <- db_get_query_safe(con, sprintf("
       SELECT pitcher, COUNT(*) as modifications 
       FROM %s 
       WHERE namespace = %s
       GROUP BY pitcher 
       ORDER BY modifications DESC
     ", tbl, ns_clause))
-    recent <- dbGetQuery(con, sprintf("
+    recent <- db_get_query_safe(con, sprintf("
       SELECT pitcher, date, original_pitch_type, new_pitch_type, modified_at 
       FROM %s 
       WHERE namespace = %s
@@ -2616,6 +2818,24 @@ sanitize_for_dt <- function(dfx) {
   dfx
 }
 
+# Use half-up rounding for displayed metrics to avoid banker's rounding drift.
+round_half_up <- function(x, digits = 0) {
+  x <- suppressWarnings(as.numeric(x))
+  scale <- 10^digits
+  sign(x) * floor(abs(x) * scale + 0.5 + 1e-12) / scale
+}
+
+fmt_pct_ratio <- function(num, den, digits = 1) {
+  num <- suppressWarnings(as.numeric(num))
+  den <- suppressWarnings(as.numeric(den))
+  ok <- is.finite(num) & is.finite(den) & den > 0
+  out <- rep("", max(length(num), length(den)))
+  if (!any(ok)) return(out)
+  val <- 100 * num / den
+  out[ok] <- paste0(format(round_half_up(val[ok], digits), nsmall = digits, trim = TRUE), "%")
+  out
+}
+
 format_decimal_columns <- function(df) {
   if (!is.data.frame(df) || !nrow(df)) return(df)
 
@@ -2643,7 +2863,7 @@ format_decimal_columns <- function(df) {
     scale100 <- if (all(is.na(v) | v <= 1.5, na.rm = TRUE)) 100 else 1
     sapply(v, function(val) {
       if (!is.finite(val)) return("")
-      paste0(round(val * scale100, 1), "%")
+      paste0(format(round_half_up(val * scale100, 1), nsmall = 1, trim = TRUE), "%")
     }, USE.NAMES = FALSE)
   }
 
@@ -2774,7 +2994,7 @@ safe_make_summary <- function(df, group_col = "TaggedPitchType") {
   })
 }
 
-datatable_with_colvis <- function(df, lock = character(0), remember = TRUE, default_visible = names(df), mode = NULL, enable_colors = TRUE) {
+datatable_with_colvis <- function(df, lock = character(0), remember = TRUE, default_visible = names(df), mode = NULL, enable_colors = TRUE, pin_all_row = FALSE, pin_col = "Player") {
   # Enhanced error handling wrapper with validation
   tryCatch({
     # Validate input before processing
@@ -2784,6 +3004,11 @@ datatable_with_colvis <- function(df, lock = character(0), remember = TRUE, defa
     
     df <- sanitize_for_dt(df)
     df <- format_decimal_columns(df)
+    
+    if (isTRUE(pin_all_row) && pin_col %in% names(df)) {
+      pin_vals <- toupper(trimws(as.character(df[[pin_col]])))
+      df[["..pin_all"]] <- ifelse(pin_vals == "ALL", 0L, 1L)
+    }
     
     # Wrap blank_ea_except_all in tryCatch to handle column mismatches gracefully
     df <- tryCatch({
@@ -2807,6 +3032,10 @@ datatable_with_colvis <- function(df, lock = character(0), remember = TRUE, defa
     if (length(hide_idx)) {
       defs <- c(defs, list(list(visible = FALSE, targets = hide_idx)))
     }
+    pin_idx <- which(names(df) == "..pin_all") - 1
+    if (length(pin_idx)) {
+      defs <- c(defs, list(list(visible = FALSE, targets = pin_idx, searchable = FALSE)))
+    }
     idx_hash <- which(names(df) == "#") - 1
     if (length(idx_hash)) {
       defs <- c(defs, list(list(
@@ -2819,34 +3048,46 @@ datatable_with_colvis <- function(df, lock = character(0), remember = TRUE, defa
     
     build_dt <- function(data) {
       data <- as.data.frame(data, stringsAsFactors = FALSE, check.names = FALSE)
+      opts <- list(
+        dom           = "Bfrtip",
+        buttons       = list(
+          "pageLength",
+          list(extend = "colvis", text = "Columns", columns = colvis_idx, postfixButtons = list("colvisRestore"))
+        ),
+        ordering      = TRUE,
+        orderMulti    = TRUE,
+        orderClasses  = TRUE,
+        colReorder    = TRUE,
+        fixedHeader   = TRUE,
+        stateSave     = remember,
+        stateDuration = -1,
+        pageLength    = 10,
+        autoWidth     = FALSE,    # Changed from TRUE - lets DataTables calculate proper widths
+        scrollX       = TRUE,      # Enable horizontal scrolling
+        scrollCollapse = TRUE,     # Allow scroll container to collapse
+        columnDefs    = defs
+      )
+      if (length(pin_idx)) {
+        opts$orderFixed <- list(pre = list(list(pin_idx[[1]], "asc")))
+      }
       DT::datatable(
         data,
         rownames   = FALSE,
         extensions = c("Buttons","ColReorder","FixedHeader"),
         escape     = FALSE,
-        options = list(
-          dom           = "Bfrtip",
-          buttons       = list(
-            "pageLength",
-            list(extend = "colvis", text = "Columns", columns = colvis_idx, postfixButtons = list("colvisRestore"))
-          ),
-          ordering      = TRUE,
-          orderMulti    = TRUE,
-          orderClasses  = TRUE,
-          colReorder    = TRUE,
-          fixedHeader   = TRUE,
-          stateSave     = remember,
-          stateDuration = -1,
-          pageLength    = 10,
-          autoWidth     = FALSE,    # Changed from TRUE - lets DataTables calculate proper widths
-          scrollX       = TRUE,      # Enable horizontal scrolling
-          scrollCollapse = TRUE,     # Allow scroll container to collapse
-          columnDefs    = defs
-        )
+        options = opts
       )
     }
     
     dt <- build_dt(df)
+    if (isTRUE(pin_all_row) && pin_col %in% names(df)) {
+      dt <- dt %>%
+        DT::formatStyle(
+          pin_col,
+          target = "row",
+          fontWeight = DT::styleEqual("All", "700")
+        )
+    }
     
     color_modes <- c("Process","Live","Results","Bullpen")
     if (identical(mode, "Usage")) {
@@ -3222,8 +3463,7 @@ get_process_thresholds <- function(column_name, pitch_type) {
   ifelse(is.finite(den) & den != 0, num/den, NA_real_)
 }
 .s_fmt_pct1 <- function(num, den) {
-  p <- .s_safe_div(num, den)
-  ifelse(is.finite(p), paste0(round(100*p, 1), "%"), "")
+  fmt_pct_ratio(num, den, digits = 1)
 }
 .s_ip_fmt <- function(ip_num) {
   if (!is.finite(ip_num)) return(NA_character_)
@@ -3476,7 +3716,7 @@ make_session_logs_table <- function(df) {
           d$PlateLocHeight>= zb  & d$PlateLocHeight<= zt, 1.47,
         ifelse(
           d$PlateLocSide >= -1.5 & d$PlateLocSide <= 1.5 &
-            d$PlateLocHeight>= (2.65 - 1.5) & d$PlateLocHeight <= (2.65 + 1.5),
+            d$PlateLocHeight>= (((ZONE_BOTTOM + ZONE_TOP) / 2) - 1.5) & d$PlateLocHeight <= (((ZONE_BOTTOM + ZONE_TOP) / 2) + 1.5),
           0.73, 0
         )
       )
@@ -3517,7 +3757,7 @@ make_session_logs_table <- function(df) {
         ),
         `Comp%`  = .s_safe_div(
           sum(d$PlateLocSide >= -1.5 & d$PlateLocSide <= 1.5 &
-                d$PlateLocHeight >= (2.65 - 1.5) & d$PlateLocHeight <= (2.65 + 1.5), na.rm = TRUE),
+                d$PlateLocHeight >= (((ZONE_BOTTOM + ZONE_TOP) / 2) - 1.5) & d$PlateLocHeight <= (((ZONE_BOTTOM + ZONE_TOP) / 2) + 1.5), na.rm = TRUE),
           nrow(d)
         ),
         `Strike%`= .s_safe_div(
@@ -3568,11 +3808,25 @@ assign_where <- function(vec, cond, value) {
   vec
 }
 
+# Choose a recent window from available event dates instead of a single day.
+# This avoids blank charts/tables when the latest date has no qualifying rows.
+recent_date_window <- function(date_vec, n_days = 7L) {
+  dv <- suppressWarnings(as.Date(date_vec))
+  dv <- sort(unique(dv[is.finite(dv)]))
+  if (!length(dv)) return(NULL)
+  n_days <- suppressWarnings(as.integer(n_days))
+  if (is.na(n_days) || n_days < 1L) n_days <- 7L
+  end_date <- dv[[length(dv)]]
+  start_idx <- max(1L, length(dv) - n_days + 1L)
+  start_date <- dv[[start_idx]]
+  c(start_date, end_date)
+}
+
 # ----- Hover tooltip helpers -----
 inzone_label <- function(side, height) {
   comp   <- !is.na(side) & !is.na(height) &
     side >= -1.5 & side <= 1.5 &
-    height >= (2.65 - 1.5) & height <= (2.65 + 1.5)
+    height >= (((ZONE_BOTTOM + ZONE_TOP) / 2) - 1.5) & height <= (((ZONE_BOTTOM + ZONE_TOP) / 2) + 1.5)
   inzone <- !is.na(side) & !is.na(height) &
     side >= ZONE_LEFT & side <= ZONE_RIGHT &
     height >= ZONE_BOTTOM & height <= ZONE_TOP
@@ -3589,7 +3843,8 @@ fmt_rate3 <- function(x) {
 fmt_num2  <- function(x) ifelse(is.finite(x), sprintf("%.2f", x), "")
 fmt_pct1  <- function(num, den) {
   num <- suppressWarnings(as.numeric(num)); den <- suppressWarnings(as.numeric(den))
-  if (is.finite(den) && den > 0 && is.finite(num)) paste0(round(100*num/den, 1), "%") else ""
+  out <- fmt_pct_ratio(num, den, digits = 1)
+  if (length(out)) out[[1]] else ""
 }
 
 make_hover_tt <- function(df) {
@@ -3898,6 +4153,26 @@ create_qp_locations_plot <- function(data, count_state, pitcher_hand, batter_han
         pitch_type = pt
       )
     }))
+    zone_dx <- (ZONE_RIGHT - ZONE_LEFT) / 3
+    zone_dy <- (ZONE_TOP - ZONE_BOTTOM) / 3
+    strike_zone_grid_all <- do.call(rbind, lapply(pitch_types, function(pt) {
+      rbind(
+        data.frame(
+          x = c(ZONE_LEFT + zone_dx, ZONE_LEFT + 2 * zone_dx),
+          xend = c(ZONE_LEFT + zone_dx, ZONE_LEFT + 2 * zone_dx),
+          y = ZONE_BOTTOM,
+          yend = ZONE_TOP,
+          pitch_type = pt
+        ),
+        data.frame(
+          x = ZONE_LEFT,
+          xend = ZONE_RIGHT,
+          y = c(ZONE_BOTTOM + zone_dy, ZONE_BOTTOM + 2 * zone_dy),
+          yend = c(ZONE_BOTTOM + zone_dy, ZONE_BOTTOM + 2 * zone_dy),
+          pitch_type = pt
+        )
+      )
+    }))
     
     home_plate_all <- do.call(rbind, lapply(pitch_types, function(pt) {
       data.frame(
@@ -3929,6 +4204,13 @@ create_qp_locations_plot <- function(data, count_state, pitcher_hand, batter_han
       geom_rect(data = strike_zone_all, 
                 aes(xmin = xmin, xmax = xmax, ymin = ymin, ymax = ymax),
                 fill = NA, color = line_col, linewidth = 1) +
+      geom_segment(
+        data = strike_zone_grid_all,
+        aes(x = x, xend = xend, y = y, yend = yend),
+        inherit.aes = FALSE,
+        color = line_col,
+        linewidth = 0.5
+      ) +
       # Add pitched balls with interactive tooltips and pitch type colors
       {if (nrow(state_data_with_result) > 0) {
         ggiraph::geom_point_interactive(
@@ -4280,8 +4562,8 @@ ZONE_TOP    <-  3.6
 # Competitive rectangle (same as your dashed box)
 COMP_LEFT   <- -1.5
 COMP_RIGHT  <-  1.5
-COMP_BOTTOM <-  2.65 - 1.5   # 1.15
-COMP_TOP    <-  2.65 + 1.5   # 4.15
+COMP_BOTTOM <-  ((ZONE_BOTTOM + ZONE_TOP) / 2) - 1.5
+COMP_TOP    <-  ((ZONE_BOTTOM + ZONE_TOP) / 2) + 1.5
 
 # Map (Balls, Strikes) to Ahead / Even / Behind like your count filter
 count_state_vec <- function(b, s) {
@@ -4532,6 +4814,45 @@ session_cols_for_mode <- function(dark_on = FALSE) {
 # Filters
 # ---- Filters: Zone & In-Zone ----
 
+pitching_zone_location_choices <- c(
+  "All",
+  "Upper Half", "Bottom Half", "Glove Side Half", "Arm Side Half",
+  "Upper 3rd", "Bottom 3rd", "Glove Side 3rd", "Arm Side 3rd"
+)
+
+pitching_split_by_choices <- c(
+  "Pitch Types", "Batter Hand", "Count", "After Count",
+  "Zone Location", "Times Through Order", "Velocity", "IVB", "HB", "Batter", "Catcher"
+)
+
+hitting_split_by_choices <- c(
+  "Pitch Types", "Pitcher Hand", "Count", "After Count",
+  "Zone Location", "Times Through Order", "Velocity", "IVB", "HB", "Pitcher", "Catcher"
+)
+
+universal_split_by_choices <- c(
+  "Pitch Types", "Batter Hand", "Pitcher Hand", "Count", "After Count",
+  "Zone Location", "Times Through Order", "Velocity", "IVB", "HB", "Batter", "Pitcher", "Catcher"
+)
+
+format_name_first_last <- function(names_vec) {
+  x <- as.character(names_vec)
+  out <- trimws(x)
+  out[!nzchar(out)] <- NA_character_
+  has_comma <- !is.na(out) & grepl(",", out, fixed = TRUE)
+  if (any(has_comma)) {
+    out[has_comma] <- vapply(out[has_comma], function(nm) {
+      parts <- strsplit(nm, ",\\s*")[[1]]
+      if (length(parts) >= 2 && nzchar(parts[1]) && nzchar(parts[2])) {
+        paste(parts[2], parts[1])
+      } else {
+        nm
+      }
+    }, character(1))
+  }
+  out
+}
+
 # Multi-select halves/thirds with INTERSECTION logic, bounded to the strike zone
 # ---- Filters: Zone bands that extend beyond the zone ----
 # Halves/Thirds act as threshold lines:
@@ -4539,10 +4860,10 @@ session_cols_for_mode <- function(dark_on = FALSE) {
 #   - Bottom Half     => y <= mid_y      (and below the zone)
 #   - Upper 3rd       => y >= B + 2*dy   (and above the zone)
 #   - Bottom 3rd      => y <= B + dy     (and below the zone)
-#   - Left Half       => x <= mid_x      (and left of the zone)
-#   - Right Half      => x >= mid_x      (and right of the zone)
-#   - Left 3rd        => x <= L + dx     (and left of the zone)
-#   - Right 3rd       => x >= L + 2*dx   (and right of the zone)
+#   - Glove Side Half => x <= mid_x for RHP, x >= mid_x for LHP
+#   - Arm Side Half   => x >= mid_x for RHP, x <= mid_x for LHP
+#   - Glove Side 3rd  => x <= L + dx for RHP, x >= L + 2*dx for LHP
+#   - Arm Side 3rd    => x >= L + 2*dx for RHP, x <= L + dx for LHP
 # Multiple selections are ANDed together (intersection).
 enforce_zone <- function(df, choice) {
   # Pass-through if nothing picked or "All"
@@ -4567,6 +4888,12 @@ enforce_zone <- function(df, choice) {
   mask_vert <- rep(TRUE, length(x))
   mask_horz <- rep(TRUE, length(x))
   
+  # Handedness per pitch for glove/arm-side mapping (default unknown to right-handed mapping)
+  throws_vec <- if ("PitcherThrows" %in% names(df)) as.character(df$PitcherThrows) else rep(NA_character_, length(x))
+  throws_norm <- toupper(substr(trimws(throws_vec), 1, 1))
+  is_lefty <- throws_norm == "L"
+  ifelse_hand <- function(left_cond, right_cond) ifelse(is_lefty, left_cond, right_cond)
+  
   # Apply each token as a threshold restriction
   for (tok in choice) {
     if (tok %in% c("Upper Half", "Bottom Half", "Upper 3rd", "Bottom 3rd")) {
@@ -4577,12 +4904,22 @@ enforce_zone <- function(df, choice) {
                      "Bottom 3rd"  = (y <= (B + dy))
       )
       mask_vert <- mask_vert & cond
-    } else if (tok %in% c("Left Half", "Right Half", "Left 3rd", "Right 3rd")) {
+    } else if (tok %in% c(
+      "Left Half", "Right Half", "Left 3rd", "Right 3rd",
+      "Glove Side Half", "Arm Side Half", "Glove Side 3rd", "Arm Side 3rd",
+      "Glove Side", "Arm Side"
+    )) {
       cond <- switch(tok,
                      "Left Half"  = (x <= mid_x),
                      "Right Half" = (x >= mid_x),
                      "Left 3rd"   = (x <= (L + dx)),
-                     "Right 3rd"  = (x >= (L + 2*dx))
+                     "Right 3rd"  = (x >= (L + 2*dx)),
+                     "Glove Side Half" = ifelse_hand(x >= mid_x, x <= mid_x),
+                     "Arm Side Half"   = ifelse_hand(x <= mid_x, x >= mid_x),
+                     "Glove Side 3rd"  = ifelse_hand(x >= (L + 2*dx), x <= (L + dx)),
+                     "Arm Side 3rd"    = ifelse_hand(x <= (L + dx), x >= (L + 2*dx)),
+                     "Glove Side"      = ifelse_hand(x >= mid_x, x <= mid_x),
+                     "Arm Side"        = ifelse_hand(x <= mid_x, x >= mid_x)
       )
       mask_horz <- mask_horz & cond
     } else {
@@ -4612,7 +4949,7 @@ enforce_inzone <- function(df, choice) {
     df[!in_zone, , drop = FALSE]
   } else if (identical(choice, "Competitive")) {
     comp <- (x >= -1.5 & x <= 1.5 &
-               y >= (2.65 - 1.5) & y <= (2.65 + 1.5))
+               y >= (((ZONE_BOTTOM + ZONE_TOP) / 2) - 1.5) & y <= (((ZONE_BOTTOM + ZONE_TOP) / 2) + 1.5))
     df[comp, , drop = FALSE]
   } else {
     df
@@ -4846,21 +5183,132 @@ apply_split_by <- function(df, split_choice) {
       split_vals[mid] <- paste0(floor(hb[mid] / 2) * 2, "-", floor(hb[mid] / 2) * 2 + 1)
       df %>% dplyr::mutate(SplitColumn = split_vals)
     },
+
+    "Zone Location" = {
+      x <- suppressWarnings(as.numeric(get_first_existing(df, c("PlateLocSide"))))
+      y <- suppressWarnings(as.numeric(get_first_existing(df, c("PlateLocHeight"))))
+      ok <- is.finite(x) & is.finite(y)
+      mid_x <- (ZONE_LEFT + ZONE_RIGHT) / 2
+      mid_y <- (ZONE_BOTTOM + ZONE_TOP) / 2
+      dx <- (ZONE_RIGHT - ZONE_LEFT) / 3
+      dy <- (ZONE_TOP - ZONE_BOTTOM) / 3
+      L <- ZONE_LEFT
+
+      throws_vec <- get_first_existing(df, c("PitcherThrows", "PitcherHand", "Pitcher Hand"))
+      throws_norm <- toupper(substr(trimws(throws_vec), 1, 1))
+      is_lefty <- throws_norm == "L"
+
+      cond_mat <- cbind(
+        "Upper Half" = (y >= mid_y),
+        "Bottom Half" = (y <= mid_y),
+        "Glove Side Half" = ifelse(is_lefty, x >= mid_x, x <= mid_x),
+        "Arm Side Half" = ifelse(is_lefty, x <= mid_x, x >= mid_x),
+        "Upper 3rd" = (y >= (ZONE_BOTTOM + 2 * dy)),
+        "Bottom 3rd" = (y <= (ZONE_BOTTOM + dy)),
+        "Glove Side 3rd" = ifelse(is_lefty, x >= (L + 2 * dx), x <= (L + dx)),
+        "Arm Side 3rd" = ifelse(is_lefty, x <= (L + dx), x >= (L + 2 * dx))
+      )
+      cond_mat[!ok, ] <- FALSE
+      cond_mat[is.na(cond_mat)] <- FALSE
+
+      labels_by_row <- lapply(seq_len(nrow(df)), function(i) {
+        labs <- colnames(cond_mat)[cond_mat[i, ]]
+        if (length(labs)) labs else "Unknown"
+      })
+
+      row_idx <- rep.int(seq_len(nrow(df)), times = lengths(labels_by_row))
+      split_vals <- unlist(labels_by_row, use.names = FALSE)
+      out <- df[row_idx, , drop = FALSE]
+      out$SplitColumn <- split_vals
+      out
+    },
+
+    "Times Through Order" = {
+      n <- nrow(df)
+      pitcher <- get_first_existing(df, c("Pitcher", "Player"))
+      batter <- get_first_existing(df, c("Batter", "Hitter"))
+      game <- get_first_existing(df, c("GameID", "GameUID", "GameForeignID"))
+      if (all(is.na(game) | !nzchar(trimws(game)))) {
+        game <- get_first_existing(df, c("Date", "UTCDate", "LocalDateTime"))
+      }
+
+      korbb <- get_first_existing(df, c("KorBB"))
+      play_res <- get_first_existing(df, c("PlayResult"))
+      terminal <- (!is.na(korbb) & nzchar(trimws(korbb)) & trimws(korbb) != "Undefined") |
+        (!is.na(play_res) & nzchar(trimws(play_res)) & trimws(play_res) != "Undefined")
+
+      order_cols <- c("GameID", "GameUID", "GameForeignID", "Date", "UTCDateTime", "LocalDateTime",
+                      "Inning", "Top/Bottom", "PAofInning", "PitchofPA", "PitchNo")
+      order_cols <- intersect(order_cols, names(df))
+      if (length(order_cols)) {
+        ord <- do.call(order, c(unname(df[order_cols]), list(na.last = TRUE)))
+      } else {
+        ord <- seq_len(n)
+      }
+
+      d_ord <- df[ord, , drop = FALSE]
+      pitcher_ord <- as.character(pitcher)[ord]
+      batter_ord <- as.character(batter)[ord]
+      game_ord <- as.character(game)[ord]
+      terminal_ord <- as.logical(terminal[ord])
+      terminal_ord[is.na(terminal_ord)] <- FALSE
+
+      # If multiple pitchers are in the current view (e.g., "All Pitchers"),
+      # treat them as a single pitcher key for Times Through Order counting.
+      pitcher_nonempty <- pitcher_ord[!is.na(pitcher_ord) & nzchar(trimws(pitcher_ord))]
+      use_combined_pitcher_key <- length(unique(pitcher_nonempty)) > 1
+      pitcher_key <- if (use_combined_pitcher_key) rep("__ALL_PITCHERS__", length(pitcher_ord)) else pitcher_ord
+
+      key <- paste0(game_ord, "||", pitcher_key, "||", batter_ord)
+      key[is.na(game_ord) | !nzchar(trimws(game_ord)) |
+            is.na(pitcher_key) | !nzchar(trimws(pitcher_key)) |
+            is.na(batter_ord) | !nzchar(trimws(batter_ord))] <- NA_character_
+
+      d_ord$key_tto <- key
+      d_ord$terminal_tto <- terminal_ord
+      d_ord <- d_ord %>%
+        dplyr::group_by(key_tto) %>%
+        dplyr::mutate(SplitColumn = as.character(cumsum(dplyr::lag(terminal_tto, default = FALSE)) + 1L)) %>%
+        dplyr::ungroup()
+
+      if ("key_tto" %in% names(d_ord)) d_ord$key_tto <- NULL
+      if ("terminal_tto" %in% names(d_ord)) d_ord$terminal_tto <- NULL
+
+      bad_key_ord <- is.na(key)
+      if (any(bad_key_ord)) {
+        d_ord$SplitColumn[bad_key_ord] <- "Unknown"
+      }
+
+      inv <- order(ord)
+      d_ord[inv, , drop = FALSE]
+    },
     
     "Batter" = {
       batter <- get_first_existing(df, c("Batter", "Hitter", "Player"))
+      batter_display <- format_name_first_last(batter)
       df %>% dplyr::mutate(SplitColumn = ifelse(
-        !is.na(batter) & nzchar(as.character(batter)), 
-        as.character(batter), 
+        !is.na(batter_display) & nzchar(as.character(batter_display)),
+        as.character(batter_display),
         "Unknown"
       ))
     },
     
     "Pitcher" = {
       pitcher <- get_first_existing(df, c("Pitcher", "Player"))
+      pitcher_display <- format_name_first_last(pitcher)
       df %>% dplyr::mutate(SplitColumn = ifelse(
-        !is.na(pitcher) & nzchar(as.character(pitcher)), 
-        as.character(pitcher), 
+        !is.na(pitcher_display) & nzchar(as.character(pitcher_display)),
+        as.character(pitcher_display),
+        "Unknown"
+      ))
+    },
+
+    "Catcher" = {
+      catcher <- get_first_existing(df, c("Catcher"))
+      catcher_display <- format_name_first_last(catcher)
+      df %>% dplyr::mutate(SplitColumn = ifelse(
+        !is.na(catcher_display) & nzchar(as.character(catcher_display)),
+        as.character(catcher_display),
         "Unknown"
       ))
     },
@@ -4966,19 +5414,73 @@ usage_by_type <- function(df) {
 library(readr)
 library(stringr)   # explicit, even though tidyverse includes it
 
+# Startup timing checkpoints for deploy-time diagnostics.
+startup_time_origin <- Sys.time()
+startup_time_last <- startup_time_origin
+log_startup_timing <- function(label) {
+  now <- Sys.time()
+  step_secs <- as.numeric(difftime(now, startup_time_last, units = "secs"))
+  total_secs <- as.numeric(difftime(now, startup_time_origin, units = "secs"))
+  message(sprintf("⏱️ [startup] %s | step=%.2fs total=%.2fs", label, step_secs, total_secs))
+  startup_time_last <<- now
+}
+log_startup_timing("Begin data import")
+
 # Point to the app's local data folder (works locally & on shinyapps.io)
 data_parent <- normalizePath(file.path(getwd(), "data"), mustWork = TRUE)
+pitch_data_backend_result <- NULL
+pitch_data_loaded_from_backend <- FALSE
+backend_mode <- tolower(trimws(Sys.getenv("PITCH_DATA_BACKEND", "auto")))
+postgres_backend_required <- backend_mode %in% c("postgres", "neon", "pg")
+
+pitch_data_backend_result <- tryCatch(
+  load_pitch_data_with_backend(
+    local_data_dir = data_parent,
+    school_code = current_school(),
+    startup_logger = log_startup_timing
+  ),
+  error = function(e) {
+    message("Pitch data backend init error: ", e$message)
+    NULL
+  }
+)
+
+if (!is.null(pitch_data_backend_result) &&
+    is.list(pitch_data_backend_result) &&
+    !is.null(pitch_data_backend_result$data)) {
+  pitch_data <- pitch_data_backend_result$data
+  all_csvs <- unique(as.character(pitch_data_backend_result$source_files %||% character(0)))
+  pitch_data_loaded_from_backend <- TRUE
+  log_startup_timing(sprintf(
+    "Loaded pitch_data from backend (%d rows, %d source files)",
+    nrow(pitch_data), length(all_csvs)
+  ))
+}
 
 # Find every CSV under data/, keep only those under practice/ or V3/
-all_csvs <- list.files(
-  path       = data_parent,
-  pattern    = "\\.csv$",
-  recursive  = TRUE,
-  full.names = TRUE
-)
-all_csvs <- all_csvs[ grepl("([/\\\\]practice[/\\\\])|([/\\\\]v3[/\\\\])", tolower(all_csvs)) ]
+if (!pitch_data_loaded_from_backend && isTRUE(postgres_backend_required)) {
+  all_csvs <- character(0)
+  pitch_data <- data.frame()
+  warning(
+    "PITCH_DATA_BACKEND=", backend_mode,
+    " requires Neon/Postgres, but backend load failed. CSV fallback is disabled in strict backend mode."
+  )
+} else if (!pitch_data_loaded_from_backend) {
+  all_csvs <- list.files(
+    path       = data_parent,
+    pattern    = "\\.csv$",
+    recursive  = TRUE,
+    full.names = TRUE
+  )
+  all_csvs <- all_csvs[ grepl("([/\\\\]practice[/\\\\])|([/\\\\]v3[/\\\\])", tolower(all_csvs)) ]
+  log_startup_timing(sprintf("Discovered %d practice/v3 CSV files", length(all_csvs)))
 
-if (!length(all_csvs)) stop("No CSVs found under: ", data_parent)
+  if (!length(all_csvs)) {
+    pitch_data <- data.frame()
+  }
+} else {
+  all_csvs <- unique(as.character(all_csvs %||% character(0)))
+}
 
 # Map folder → SessionType
 infer_session_from_path <- function(fp) {
@@ -5252,7 +5754,10 @@ draw_heat <- function(grid, bins = HEAT_BINS, pal_fun = heat_pal_red,
 }
 
 
-pitch_data <- purrr::map_dfr(all_csvs, read_one)
+if (!pitch_data_loaded_from_backend && !isTRUE(postgres_backend_required)) {
+  pitch_data <- purrr::map_dfr(all_csvs, read_one)
+  log_startup_timing(sprintf("Read %d CSV files into pitch_data (%d rows)", length(all_csvs), nrow(pitch_data)))
+}
 
 # Ensure required columns exist since downstream code expects them
 # ------ add to need_cols ------
@@ -5262,15 +5767,18 @@ need_cols <- c(
   "SpinEfficiency","SpinRate","RelHeight","RelSide","Extension",
   "VertApprAngle","HorzApprAngle","PlateLocSide","PlateLocHeight",
   "PitchCall","KorBB","Balls","Strikes","SessionType","PlayID",
-  "ExitSpeed","Angle","BatterSide",
+  "ExitSpeed","Angle","Distance","Direction","BatterSide",
+  "ThrowSpeed","ExchangeTime","PopTime","TimeToBase",
+  "BasePositionX","BasePositionY","BasePositionZ","TargetBase",
   "PlayResult","TaggedHitType","OutsOnPlay",
   "Batter", "Catcher",
-  "VideoClip","VideoClip2","VideoClip3"
+  "VideoClip","VideoClip2","VideoClip3",
+  "SourceFile"
 )
 
 
 
-for (nm in need_cols) if (!nm %in% names(pitch_data)) pitch_data[[nm]] <- NA_character_
+for (nm in need_cols) if (!nm %in% names(pitch_data)) pitch_data[[nm]] <- rep(NA_character_, nrow(pitch_data))
 
 # Type cleanup + standardization (now safe to coerce)
 pitch_data <- pitch_data %>%
@@ -5296,6 +5804,8 @@ pitch_data <- pitch_data %>%
     Extension       = as.numeric(Extension),
     ExitSpeed       = as.numeric(ExitSpeed),   # ← NEW
     Angle           = as.numeric(Angle),       # ← NEW
+    Distance        = as.numeric(Distance),
+    Direction       = as.numeric(Direction),
     BatterSide      = as.character(BatterSide), # ← NEW
     PlayResult      = as.character(PlayResult),
     Batter         = as.character(Batter),
@@ -5318,89 +5828,181 @@ pitch_data <- pitch_data %>%
   ) %>%
   dplyr::filter(!is.na(TaggedPitchType) & tolower(TaggedPitchType) != "undefined") %>%
   force_pitch_levels()
+log_startup_timing(sprintf("Completed type normalization/filtering (%d rows)", nrow(pitch_data)))
 
 # ---- Attach Cloudinary video URLs when available ----
 video_map_path <- file.path(data_parent, "video_map.csv")
 manual_map_path <- file.path(data_parent, "video_map_manual.csv")
-if (!"VideoClip"  %in% names(pitch_data)) pitch_data$VideoClip  <- NA_character_
-if (!"VideoClip2" %in% names(pitch_data)) pitch_data$VideoClip2 <- NA_character_
-if (!"VideoClip3" %in% names(pitch_data)) pitch_data$VideoClip3 <- NA_character_
-
-# Combine EdgeR and manual/iPhone video maps
-video_maps <- list()
-if (file.exists(video_map_path)) {
-  edger_raw <- suppressMessages(readr::read_csv(video_map_path, show_col_types = FALSE))
-  if (nrow(edger_raw) > 0) {
-    video_maps[["edger"]] <- edger_raw
-    message("📹 Loaded ", nrow(edger_raw), " EdgeR videos")
-  }
+ensure_video_clip_columns <- function(df) {
+  if (!"VideoClip"  %in% names(df)) df$VideoClip  <- NA_character_
+  if (!"VideoClip2" %in% names(df)) df$VideoClip2 <- NA_character_
+  if (!"VideoClip3" %in% names(df)) df$VideoClip3 <- NA_character_
+  df
 }
-if (file.exists(manual_map_path)) {
-  manual_raw <- suppressMessages(readr::read_csv(manual_map_path, show_col_types = FALSE))
-  if (nrow(manual_raw) > 0) {
-    video_maps[["manual"]] <- manual_raw
-    message("📱 Loaded ", nrow(manual_raw), " iPhone videos")
-  }
-}
+pitch_data <- ensure_video_clip_columns(pitch_data)
+pitch_play_ids <- unique(tolower(trimws(as.character(pitch_data$PlayID %||% character(0)))))
+pitch_play_ids <- pitch_play_ids[nzchar(pitch_play_ids)]
 
-if (length(video_maps) > 0) {
-  vm_raw <- dplyr::bind_rows(video_maps) %>% dplyr::distinct()
-  message("🎬 Combined total: ", nrow(vm_raw), " videos available")
-  if (nrow(vm_raw)) {
-    vm_wide <- vm_raw %>%
-      dplyr::mutate(
-        play_id = tolower(as.character(play_id)),
-        camera_slot = dplyr::case_when(
-          camera_slot %in% c("VideoClip","VideoClip2","VideoClip3") ~ camera_slot,
-          TRUE ~ NA_character_
-        ),
-        uploaded_at = suppressWarnings(lubridate::ymd_hms(uploaded_at, quiet = TRUE, tz = "UTC"))
-      ) %>%
-      dplyr::filter(
-        nzchar(play_id),
-        !is.na(camera_slot),
-        nzchar(cloudinary_url)
-      ) %>%
-      dplyr::arrange(play_id, camera_slot, dplyr::desc(uploaded_at)) %>%
-      dplyr::group_by(play_id, camera_slot) %>%
-      dplyr::slice_head(n = 1) %>%
-      dplyr::ungroup() %>%
-      tidyr::pivot_wider(
-        id_cols = play_id,
-        names_from = camera_slot,
-        values_from = cloudinary_url
-      )
-    
-    if (nrow(vm_wide)) {
-      pitch_data <- pitch_data %>%
-        dplyr::mutate(.play_lower = tolower(as.character(PlayID))) %>%
-        dplyr::left_join(vm_wide, by = c(".play_lower" = "play_id"), suffix = c("", ".vm")) %>%
-        { 
-          vm_cols <- paste0(c("VideoClip","VideoClip2","VideoClip3"), ".vm")
-          for (vm_col in vm_cols) {
-            if (!vm_col %in% names(.)) .[[vm_col]] <- NA_character_
-          }
-          .
-        } %>%
-        dplyr::mutate(
-          VideoClip  = dplyr::coalesce(.data[["VideoClip.vm"]],  VideoClip),
-          VideoClip2 = dplyr::coalesce(.data[["VideoClip2.vm"]], VideoClip2),
-          VideoClip3 = dplyr::coalesce(.data[["VideoClip3.vm"]], VideoClip3)
-        ) %>%
-        dplyr::select(-dplyr::ends_with(".vm"), -.play_lower)
-      matched_videos <- sum(nzchar(pitch_data$VideoClip %||% ""))
-      message("✅ Attached videos for ", matched_videos, " pitches from combined maps")
+video_map_wide_cache <- NULL
+video_map_cache_ready <- FALSE
+
+load_combined_video_map_wide <- function(play_ids = NULL) {
+  video_maps <- list()
+  enable_neon_video_map <- isTRUE(school_setting("enable_neon_video_map", TRUE))
+  if (enable_neon_video_map && exists("video_map_read_all_neon", mode = "function")) {
+    neon_raw <- tryCatch(video_map_read_all_neon(play_ids = play_ids), error = function(e) tibble::tibble())
+    if (nrow(neon_raw) > 0) {
+      video_maps[["neon"]] <- neon_raw
+      message("☁️ Loaded ", nrow(neon_raw), " scoped videos from Neon")
     } else {
-      message("⚠️  Video maps loaded but no rows matched PlayID in pitch data.")
+      message("☁️ Loaded 0 scoped videos from Neon (play_ids=", length(play_ids %||% character(0)), ")")
+    }
+  } else if (!enable_neon_video_map) {
+    message("🎥 Neon video map disabled for this school config")
+  }
+  if (file.exists(video_map_path)) {
+    edger_raw <- suppressMessages(readr::read_csv(video_map_path, show_col_types = FALSE))
+    if (nrow(edger_raw) > 0) {
+      video_maps[["edger"]] <- edger_raw
+      message("📹 Loaded ", nrow(edger_raw), " EdgeR videos")
     }
   }
+  if (file.exists(manual_map_path)) {
+    manual_raw <- suppressMessages(readr::read_csv(manual_map_path, show_col_types = FALSE))
+    if (nrow(manual_raw) > 0) {
+      video_maps[["manual"]] <- manual_raw
+      message("📱 Loaded ", nrow(manual_raw), " iPhone videos")
+    }
+  }
+  if (!length(video_maps)) return(tibble::tibble())
+  video_maps <- lapply(video_maps, function(df) {
+    if (!is.data.frame(df)) return(df)
+    if ("uploaded_at" %in% names(df)) {
+      df$uploaded_at <- as.character(df$uploaded_at)
+    }
+    df
+  })
+  vm_raw <- dplyr::bind_rows(video_maps) %>% dplyr::distinct()
+  message("🎬 Combined total: ", nrow(vm_raw), " videos available")
+  if (!nrow(vm_raw)) return(tibble::tibble())
+  vm_raw %>%
+    dplyr::mutate(
+      play_id = tolower(as.character(play_id)),
+      camera_slot = dplyr::case_when(
+        camera_slot %in% c("VideoClip", "VideoClip2", "VideoClip3") ~ camera_slot,
+        TRUE ~ NA_character_
+      ),
+      uploaded_at = suppressWarnings(lubridate::ymd_hms(uploaded_at, quiet = TRUE, tz = "UTC"))
+    ) %>%
+    dplyr::filter(
+      nzchar(play_id),
+      !is.na(camera_slot),
+      nzchar(cloudinary_url)
+    ) %>%
+    dplyr::arrange(play_id, camera_slot, dplyr::desc(uploaded_at)) %>%
+    dplyr::group_by(play_id, camera_slot) %>%
+    dplyr::slice_head(n = 1) %>%
+    dplyr::ungroup() %>%
+    tidyr::pivot_wider(
+      id_cols = play_id,
+      names_from = camera_slot,
+      values_from = cloudinary_url
+    )
+}
+
+attach_video_clips_from_wide <- function(df, vm_wide) {
+  df <- ensure_video_clip_columns(df)
+  if (!"PlayID" %in% names(df)) return(df)
+  if (is.null(vm_wide) || !nrow(vm_wide)) return(df)
+  df %>%
+    dplyr::mutate(
+      VideoClip = as.character(VideoClip),
+      VideoClip2 = as.character(VideoClip2),
+      VideoClip3 = as.character(VideoClip3)
+    ) %>%
+    dplyr::mutate(.play_lower = tolower(as.character(PlayID))) %>%
+    dplyr::left_join(vm_wide, by = c(".play_lower" = "play_id"), suffix = c("", ".vm")) %>%
+    {
+      vm_cols <- paste0(c("VideoClip", "VideoClip2", "VideoClip3"), ".vm")
+      for (vm_col in vm_cols) {
+        if (!vm_col %in% names(.)) .[[vm_col]] <- rep(NA_character_, nrow(.))
+        .[[vm_col]] <- as.character(.[[vm_col]])
+      }
+      .
+    } %>%
+    dplyr::mutate(
+      VideoClip = dplyr::coalesce(.data[["VideoClip.vm"]], VideoClip),
+      VideoClip2 = dplyr::coalesce(.data[["VideoClip2.vm"]], VideoClip2),
+      VideoClip3 = dplyr::coalesce(.data[["VideoClip3.vm"]], VideoClip3)
+    ) %>%
+    dplyr::select(-dplyr::ends_with(".vm"), -.play_lower)
+}
+
+ensure_video_map_loaded <- function(force = FALSE) {
+  if (!isTRUE(video_map_cache_ready) || isTRUE(force) || is.null(video_map_wide_cache)) {
+    video_map_wide_cache <<- load_combined_video_map_wide(play_ids = pitch_play_ids)
+    video_map_cache_ready <<- TRUE
+  }
+  video_map_wide_cache
+}
+
+attach_video_clips_lazy <- function(df, force = FALSE) {
+  vm_wide <- ensure_video_map_loaded(force = force)
+  attach_video_clips_from_wide(df, vm_wide)
+}
+
+defer_video_map_load <- isTRUE(school_setting("defer_video_map_load", TRUE))
+video_map_warmup_enabled <- isTRUE(school_setting("video_map_warmup_after_start", TRUE))
+video_map_warmup_delay_ms <- as.integer(school_setting("video_map_warmup_delay_ms", 8000))
+if (!is.finite(video_map_warmup_delay_ms) || video_map_warmup_delay_ms < 0L) {
+  video_map_warmup_delay_ms <- 8000L
+}
+video_map_warmup_started <- FALSE
+video_map_warmup_completed <- FALSE
+
+start_video_map_warmup <- function(delay_ms = video_map_warmup_delay_ms) {
+  if (isTRUE(video_map_warmup_started) || isTRUE(video_map_warmup_completed)) return(invisible(FALSE))
+  if (!isTRUE(defer_video_map_load) || !isTRUE(video_map_warmup_enabled)) return(invisible(FALSE))
+  video_map_warmup_started <<- TRUE
+  wait_secs <- max(0, as.numeric(delay_ms) / 1000)
+  message(sprintf("🎬 Scheduling background video warmup in %.1fs", wait_secs))
+  later::later(function() {
+    t0 <- Sys.time()
+    tryCatch({
+      ensure_video_map_loaded(force = FALSE)
+      elapsed <- as.numeric(difftime(Sys.time(), t0, units = "secs"))
+      video_map_warmup_completed <<- TRUE
+      message(sprintf("🎬 Background video warmup complete (%.2fs)", elapsed))
+    }, error = function(e) {
+      video_map_warmup_started <<- FALSE
+      message("⚠️  Background video warmup failed: ", e$message)
+    })
+  }, delay = wait_secs)
+  invisible(TRUE)
+}
+
+if (defer_video_map_load) {
+  message("🎬 Deferring video map load until first video request/filter")
+  log_startup_timing("Deferred video map merge/attachment")
+} else {
+  pitch_data <- attach_video_clips_lazy(pitch_data, force = TRUE)
+  matched_videos <- sum(nzchar(pitch_data$VideoClip %||% ""))
+  message("✅ Attached videos for ", matched_videos, " pitches from combined maps")
+  if (!matched_videos) {
+    message("⚠️  No video matches found for current pitch_data PlayID values.")
+  }
+  log_startup_timing("Completed video map merge/attachment")
 }
 
 pitch_data <- ensure_pitch_keys(pitch_data)
+log_startup_timing("Computed/validated PitchKey values")
 rows_before_dedupe <- nrow(pitch_data)
-pitch_data <- deduplicate_pitch_rows(pitch_data)
+# Keep startup dedupe cheap and always on to prevent doubled rows when upstream sync
+# includes overlapping files for the same PitchKey.
+pitch_data <- deduplicate_pitch_rows(pitch_data, fast = TRUE)
+rows_removed_dedupe <- rows_before_dedupe - nrow(pitch_data)
 rows_after_dedupe <- nrow(pitch_data)
-rows_removed_dedupe <- rows_before_dedupe - rows_after_dedupe
+log_startup_timing(sprintf("Deduplicated pitch rows (removed=%d)", rows_removed_dedupe))
 
 # Friendly load message
 counts <- table(pitch_data$SessionType, useNA = "no")
@@ -5417,7 +6019,20 @@ if (rows_removed_dedupe > 0) {
 # Read lookup table and keep Email in a separate column to avoid .x/.y
 lookup_table <- if (file.exists("lookup_table.csv")) {
   read.csv("lookup_table.csv", stringsAsFactors = FALSE) %>%
-    dplyr::rename(Pitcher = PlayerName, Email_lookup = Email)
+    dplyr::rename(Pitcher = PlayerName, Email_lookup = Email) %>%
+    dplyr::mutate(
+      Pitcher = trimws(as.character(Pitcher)),
+      Email_lookup = trimws(as.character(Email_lookup))
+    ) %>%
+    dplyr::filter(!is.na(Pitcher), nzchar(Pitcher)) %>%
+    dplyr::group_by(Pitcher) %>%
+    dplyr::summarise(
+      Email_lookup = {
+        vals <- unique(Email_lookup[!is.na(Email_lookup) & nzchar(Email_lookup)])
+        if (length(vals)) vals[[1]] else NA_character_
+      },
+      .groups = "drop"
+    )
 } else {
   data.frame(Pitcher = character(), Email_lookup = character(), stringsAsFactors = FALSE)
 }
@@ -5426,40 +6041,26 @@ lookup_table <- if (file.exists("lookup_table.csv")) {
 pitch_data <- dplyr::left_join(pitch_data, lookup_table, by = "Pitcher") %>%
   dplyr::mutate(Email = dplyr::coalesce(Email, Email_lookup)) %>%
   dplyr::select(-Email_lookup)
+log_startup_timing("Joined lookup_table and finalized Email")
+log_startup_timing("Prepared global pitch datasets and lookup joins")
 
 
 # (keep your name_map construction the same)
 raw_names <- sort(unique(pitch_data$Pitcher))
-display_names <- ifelse(
-  grepl(",", raw_names),
-  vapply(strsplit(raw_names, ",\\s*"), function(x) paste(x[2], x[1]), ""),
-  raw_names
-)
+display_names <- format_name_first_last(raw_names)
 name_map <- setNames(raw_names, display_names)
 
 raw_hitters <- sort(unique(na.omit(as.character(pitch_data$Batter))))
-hit_display <- ifelse(
-  grepl(",", raw_hitters),
-  vapply(strsplit(raw_hitters, ",\\s*"), function(x) paste(x[2], x[1]), ""),
-  raw_hitters
-)
+hit_display <- format_name_first_last(raw_hitters)
 batter_map <- setNames(raw_hitters, hit_display)
 
 # Opponent pitchers map (for hitting suite - pitchers who threw against our batters)
 raw_opp_pitchers <- sort(unique(na.omit(as.character(pitch_data$Pitcher))))
-opp_pitch_display <- ifelse(
-  grepl(",", raw_opp_pitchers),
-  vapply(strsplit(raw_opp_pitchers, ",\\s*"), function(x) paste(x[2], x[1]), ""),
-  raw_opp_pitchers
-)
+opp_pitch_display <- format_name_first_last(raw_opp_pitchers)
 opponent_pitcher_map <- setNames(raw_opp_pitchers, opp_pitch_display)
 
 raw_catchers <- sort(unique(na.omit(as.character(pitch_data$Catcher))))
-catch_display <- ifelse(
-  grepl(",", raw_catchers),
-  vapply(strsplit(raw_catchers, ",\\s*"), function(x) paste(x[2], x[1]), ""),
-  raw_catchers
-)
+catch_display <- format_name_first_last(raw_catchers)
 catcher_map <- setNames(raw_catchers, catch_display)
 
 
@@ -5596,48 +6197,14 @@ ALLOWED_CAMPERS <- school_setting("allowed_campers", c(
 # NEW: normalize for case, spaces, punctuation (so "D.J." == "DJ")
 norm_name_ci <- function(x) gsub("[^a-z]", "", tolower(trimws(as.character(x))))
 
-school_marker_tokens <- function() {
-  extra <- school_setting("team_code_markers", character(0))
-  toks <- unique(toupper(trimws(c(TEAM_CODE, school_display_name, extra))))
-  toks[nzchar(toks)]
-}
-
-row_matches_school_markers <- function(df, cols, tokens = school_marker_tokens()) {
-  cols <- intersect(cols, names(df))
-  if (!length(cols) || !length(tokens) || !nrow(df)) return(rep(FALSE, nrow(df)))
-  out <- rep(FALSE, nrow(df))
-  tokens <- toupper(trimws(as.character(tokens)))
-  tokens <- unique(tokens[nzchar(tokens)])
-  for (col in cols) {
-    vals <- toupper(trimws(as.character(df[[col]])))
-    hit <- vals %in% tokens
-    out <- out | hit
-  }
-  out
-}
-
 live_bp_mask <- function(df) {
   if (!nrow(df)) return(logical(0))
-  is_live <- as.character(df$SessionType) == "Live"
-  p_cols <- intersect(c("PitcherTeam", "PitcherTeamCode", "PitcherTeamForeignID"), names(df))
-  b_cols <- intersect(c("BatterTeam", "BatterTeamCode", "BatterTeamForeignID"), names(df))
-  if (!length(p_cols)) p_cols <- intersect(c("HomeTeam", "AwayTeam", "HomeTeamForeignID", "AwayTeamForeignID"), names(df))
-  if (!length(b_cols)) b_cols <- intersect(c("HomeTeam", "AwayTeam", "HomeTeamForeignID", "AwayTeamForeignID"), names(df))
-  p_mark <- row_matches_school_markers(df, p_cols)
-  b_mark <- row_matches_school_markers(df, b_cols)
-  is_live & p_mark & b_mark
+  as.character(df$SessionType) == "Live"
 }
 
 season_mask <- function(df) {
   if (!nrow(df)) return(logical(0))
-  is_live <- as.character(df$SessionType) == "Live"
-  p_cols <- intersect(c("PitcherTeam", "PitcherTeamCode", "PitcherTeamForeignID"), names(df))
-  b_cols <- intersect(c("BatterTeam", "BatterTeamCode", "BatterTeamForeignID"), names(df))
-  if (!length(p_cols)) p_cols <- intersect(c("HomeTeam", "AwayTeam", "HomeTeamForeignID", "AwayTeamForeignID"), names(df))
-  if (!length(b_cols)) b_cols <- intersect(c("HomeTeam", "AwayTeam", "HomeTeamForeignID", "AwayTeamForeignID"), names(df))
-  p_mark <- row_matches_school_markers(df, p_cols)
-  b_mark <- row_matches_school_markers(df, b_cols)
-  is_live & xor(p_mark, b_mark)
+  as.character(df$SessionType) == "Live"
 }
 
 normalize_session_filter_value <- function(session_value) {
@@ -5668,82 +6235,12 @@ session_type_choices <- function() {
   c("Season", "Bullpen", "Live BP" = "Live", "All")
 }
 
-verify_allowed_players_by_school <- function(df, player_col, allowed_names, label = "players") {
-  allowed_names <- unique(as.character(allowed_names))
-  allowed_names <- allowed_names[nzchar(trimws(allowed_names))]
-  if (!length(allowed_names)) return(allowed_names)
-  if (!player_col %in% names(df)) return(character(0))
+# Marker-based school verification removed: keep configured allowed player lists as-is.
 
-  marker_cols <- intersect(c(
-    "PitcherTeam", "BatterTeam", "CatcherTeam",
-    "HomeTeam", "AwayTeam",
-    "HomeTeamForeignID", "AwayTeamForeignID", "GameForeignID"
-  ), names(df))
-  if (!length(marker_cols)) {
-    message("No team marker columns found for ", label, " verification; keeping configured list as-is.")
-    return(allowed_names)
-  }
-
-  tokens <- school_marker_tokens()
-  if (!length(tokens)) {
-    message("No school marker tokens configured; keeping configured ", label, " list as-is.")
-    return(allowed_names)
-  }
-
-  allowed_norm <- unique(norm_name_ci(allowed_names))
-  dat <- df %>%
-    dplyr::mutate(.player_norm = norm_name_ci(.data[[player_col]])) %>%
-    dplyr::filter(.player_norm %in% allowed_norm)
-  if (!nrow(dat)) return(character(0))
-
-  row_has_school <- rep(FALSE, nrow(dat))
-  tokens <- toupper(trimws(as.character(tokens)))
-  tokens <- unique(tokens[nzchar(tokens)])
-  for (col in marker_cols) {
-    vals <- toupper(trimws(as.character(dat[[col]])))
-    col_has <- vals %in% tokens
-    row_has_school <- row_has_school | col_has
-  }
-
-  verified_norm <- unique(dat$.player_norm[row_has_school])
-  verified <- allowed_names[norm_name_ci(allowed_names) %in% verified_norm]
-  verified <- unique(verified)
-
-  dropped <- setdiff(allowed_names, verified)
-  if (length(dropped)) {
-    message(
-      "School-code verification removed ", length(dropped),
-      " configured ", label, " with no matching school marker rows."
-    )
-  }
-  verified
-}
-
-# Enforce team-code evidence for configured school player lists.
-verification_pool_v3 <- pitch_data %>%
-  dplyr::filter(
-    SessionType == "Live" |
-      grepl("[/\\\\]v3[/\\\\]", tolower(as.character(SourceFile)))
-  )
-ALLOWED_PITCHERS <- verify_allowed_players_by_school(
-  verification_pool_v3, player_col = "Pitcher", allowed_names = ALLOWED_PITCHERS, label = "pitchers"
-)
-ALLOWED_HITTERS <- verify_allowed_players_by_school(
-  verification_pool_v3, player_col = "Batter", allowed_names = ALLOWED_HITTERS, label = "hitters"
-)
-
-# Keep the full dataset for Hitting & global refs
-# but build a PITCHING-ONLY copy that is filtered to the whitelist
-# (affects Pitching, Comparison, Leaderboard modules that use pitch_data_pitching)
-# If you ever want admins to bypass this, wrap the filter in `if (!is_admin()) { ... }`.
-pitch_data_pitching <- pitch_data %>%
-  dplyr::mutate(
-    Pitcher = as.character(Pitcher),
-    # Build a "First Last" display from "Last, First" for matching either style
-    .disp = ifelse(grepl(",", Pitcher),
-                   paste0(trimws(sub(".*,", "", Pitcher)), " ", trimws(sub(",.*", "", Pitcher))),
-                   Pitcher)
-  )
+# Keep the full dataset for Hitting & global refs, but build a PITCHING-only
+# copy filtered to the whitelist.
+pitch_data_pitching <- pitch_data
+pitch_data_pitching$Pitcher <- as.character(pitch_data_pitching$Pitcher)
 
 # Accept either "Last, First" or "First Last" in ALLOWED_PITCHERS
 ALLOWED_PITCHERS_DL <- unique(c(
@@ -5771,7 +6268,7 @@ ALLOWED_CAMPERS_DL <- unique(c(
 ALL_ALLOWED_PITCHERS <- unique(c(ALLOWED_PITCHERS_DL, ALLOWED_CAMPERS_DL))
 ALL_ALLOWED_HITTERS  <- unique(c(ALLOWED_HITTERS_DL,  ALLOWED_CAMPERS_DL))
 
-# Robust, case/spacing/punctuation-insensitive filter
+# Robust, case/spacing/punctuation-insensitive filter.
 allowed_norm <- norm_name_ci(ALL_ALLOWED_PITCHERS)
 
 workload_filter_players_by_team <- function(names, team_type = "All") {
@@ -5799,22 +6296,38 @@ workload_filter_players_by_team <- function(names, team_type = "All") {
   sort(unique(res))
 }
 
-pitch_data_pitching <- pitch_data_pitching %>%
-  dplyr::mutate(.norm_raw  = norm_name_ci(Pitcher),
-                .norm_disp = norm_name_ci(.disp)) %>%
-  dplyr::filter(.norm_raw %in% allowed_norm | .norm_disp %in% allowed_norm) %>%
-  dplyr::select(-.disp, -.norm_raw, -.norm_disp)
+# Build an allowed lookup at unique-name level; this avoids repeated regex work
+# over every row and removes the startup hotspot.
+pitcher_raw <- as.character(pitch_data_pitching$Pitcher)
+uniq_pitchers <- unique(pitcher_raw)
+uniq_pitchers <- uniq_pitchers[!is.na(uniq_pitchers)]
+if (length(uniq_pitchers)) {
+  uniq_disp <- ifelse(
+    grepl(",", uniq_pitchers),
+    paste0(trimws(sub(".*,", "", uniq_pitchers)), " ", trimws(sub(",.*", "", uniq_pitchers))),
+    uniq_pitchers
+  )
+  uniq_allowed <- norm_name_ci(uniq_pitchers) %in% allowed_norm |
+    norm_name_ci(uniq_disp) %in% allowed_norm
+  allowed_lookup <- setNames(uniq_allowed, uniq_pitchers)
+  mask_pitching <- unname(allowed_lookup[pitcher_raw])
+  mask_pitching[is.na(mask_pitching)] <- FALSE
+} else {
+  mask_pitching <- rep(FALSE, nrow(pitch_data_pitching))
+}
+pitch_data_pitching <- pitch_data_pitching[mask_pitching, , drop = FALSE]
 
-pitch_data_pitching <- ensure_pitch_keys(pitch_data_pitching)
+# Only compute PitchKey when missing/blank to avoid expensive recomputation.
+if (!"PitchKey" %in% names(pitch_data_pitching) ||
+    any(is.na(pitch_data_pitching$PitchKey) | !nzchar(as.character(pitch_data_pitching$PitchKey)))) {
+  pitch_data_pitching <- ensure_pitch_keys(pitch_data_pitching)
+}
 
 # Name map for Pitching UI (restricted to the filtered set)
 raw_names_p <- sort(unique(pitch_data_pitching$Pitcher))
-display_names_p <- ifelse(
-  grepl(",", raw_names_p),
-  vapply(strsplit(raw_names_p, ",\\s*"), function(x) paste(x[2], x[1]), ""),
-  raw_names_p
-)
+display_names_p <- format_name_first_last(raw_names_p)
 name_map_pitching <- setNames(raw_names_p, display_names_p)
+log_startup_timing("Prepared pitching-only dataset and name maps")
 
 
 # ---- NEW: xStat reference bins from your data ----
@@ -5842,6 +6355,7 @@ x_overall <- xbin_ref %>%
     p1B = weighted.mean(p1B, n), p2B = weighted.mean(p2B, n),
     p3B = weighted.mean(p3B, n), pHR = weighted.mean(pHR, n)
   )
+log_startup_timing("Built xStat reference bins")
 
 # FanGraphs-like wOBA weights (approx)
 W_BB <- 0.69; W_1B <- 0.90; W_2B <- 1.24; W_3B <- 1.56; W_HR <- 1.95
@@ -5871,7 +6385,8 @@ compute_usage_by_count <- function(df, original_df = NULL) {
   
   pct_string <- function(num, den) {
     if (is.na(den) || den <= 0) return("0.0%")
-    paste0(round(100 * num / den, 1), "%")
+    out <- fmt_pct_ratio(num, den, digits = 1)
+    if (length(out)) out[[1]] else "0.0%"
   }
   
   calc_usage <- function(dfi) {
@@ -6211,12 +6726,11 @@ compute_process_results <- function(df, mode = "All") {
 }
 
 # ---- Global table helpers shared by Pitching & Hitting ----
+log_startup_timing("Defined process/results calculators")
 safe_pct <- function(num, den) {
   num <- suppressWarnings(as.numeric(num))
   den <- suppressWarnings(as.numeric(den))
-  ifelse(is.finite(den) & den > 0 & is.finite(num),
-         paste0(round(100 * num / den, 1), "%"),
-         "")
+  fmt_pct_ratio(num, den, digits = 1)
 }
 
 count_state_mask <- function(balls, strikes, states) {
@@ -6828,7 +7342,7 @@ pitch_ui <- function(show_header = FALSE) {
         selectInput(
           "sessionType", "Session Type:",
           choices = session_type_choices(),
-          selected = "Season"
+          selected = "All"
         ),
         selectInput(
           "withVideo", "With Video:",
@@ -6863,9 +7377,7 @@ pitch_ui <- function(show_header = FALSE) {
         ),
         selectInput(
           "zoneLoc", "Zone Location:",
-          choices = c("All",
-                      "Upper Half","Bottom Half","Left Half","Right Half",
-                      "Upper 3rd","Bottom 3rd","Left 3rd","Right 3rd"),
+          choices = pitching_zone_location_choices,
           selected = "All",
           multiple = TRUE
         ),
@@ -7267,6 +7779,105 @@ pitch_ui <- function(show_header = FALSE) {
           )
           
           , tabPanel(
+            "Velo Manual Entry",
+            value = "manual_entry",
+            tags$style(HTML("
+              .manual-kpi-wrap { display:flex; gap:12px; flex-wrap:wrap; margin-bottom:12px; }
+              .manual-kpi { flex:1 1 180px; border-radius:12px; padding:12px 14px; color:#0f172a; background:linear-gradient(145deg,#f8fafc,#e2e8f0); border:1px solid #cbd5e1; }
+              .manual-kpi .label { font-size:11px; letter-spacing:.06em; text-transform:uppercase; color:#475569; }
+              .manual-kpi .value { font-size:24px; font-weight:700; line-height:1.1; margin-top:4px; }
+              .manual-entry-shell { background:linear-gradient(180deg,#f8fafc,#eef2ff); border:1px solid #dbeafe; border-radius:14px; padding:12px; }
+            ")),
+            tabsetPanel(
+              id = "manual_entry_tabs",
+              tabPanel(
+                "Entry",
+                br(),
+                fluidRow(
+                  column(
+                    4,
+                    div(
+                      class = "manual-entry-shell",
+                      h4("Add Velocity Entries", style = "margin-top:0;"),
+                      dateInput("manualVeloDate", "Date", value = Sys.Date(), format = "mm/dd/yyyy"),
+                      selectInput("manualVeloPitcher", "Pitcher", choices = c("All" = "All")),
+                      selectInput(
+                        "manualVeloType", "Throw Type",
+                        choices = c("Pulldowns", "Mound Velo", "Plyo Velo", "Bullpen", "Other"),
+                        selected = "Pulldowns"
+                      ),
+                      conditionalPanel(
+                        "input.manualVeloType == 'Other'",
+                        textInput("manualVeloTypeOther", "Custom Throw Type", placeholder = "e.g., Run-and-Gun")
+                      ),
+                      conditionalPanel(
+                        "input.manualVeloType == 'Plyo Velo'",
+                        selectizeInput(
+                          "manualVeloPlyoDrill", "Plyo Drill",
+                          choices = c(""),
+                          selected = "",
+                          multiple = FALSE,
+                          options = list(
+                            create = TRUE,
+                            placeholder = "Select or type a plyo drill"
+                          )
+                        )
+                      ),
+                      numericInput("manualVeloWeight", "Ball Weight (oz)", value = 5.0, min = 0.5, max = 64, step = 0.25),
+                      numericInput("manualVeloSingle", "Single Velocity (mph)", value = NA, min = 30, max = 120, step = 0.1),
+                      textAreaInput(
+                        "manualVeloBatch", "Batch Velocities",
+                        placeholder = "Enter multiple values: 90.2, 91.1, 92.0",
+                        rows = 3
+                      ),
+                      textAreaInput("manualVeloNotes", "Notes", placeholder = "Drill cue, intent, feedback...", rows = 2),
+                      actionButton("manualVeloAdd", "Save Entries", class = "btn-primary"),
+                      br(), br(),
+                      textOutput("manualVeloAddStatus")
+                    )
+                  ),
+                  column(
+                    8,
+                    div(
+                      style = "display:flex; justify-content:space-between; align-items:center; margin-bottom:8px;",
+                      h4("Recent Manual Entries", style = "margin:0;"),
+                      actionButton("manualVeloDelete", "Delete Selected", class = "btn-danger btn-sm")
+                    ),
+                    DT::dataTableOutput("manualVeloTable")
+                  )
+                )
+              ),
+              tabPanel(
+                "Progress",
+                br(),
+                fluidRow(
+                  column(
+                    3,
+                    wellPanel(
+                      selectInput("manualVeloPitcherFilter", "Pitcher", choices = c("All" = "All"), selected = "All"),
+                      selectInput("manualVeloTypeFilter", "Throw Type", choices = c("All"), selected = "All", multiple = TRUE),
+                      dateRangeInput("manualVeloDateRange", "Date Range", start = Sys.Date() - 30, end = Sys.Date()),
+                      sliderInput("manualVeloWeightRange", "Ball Weight Range (oz)", min = 0.5, max = 64, value = c(0.5, 64), step = 0.25),
+                      selectInput(
+                        "manualVeloChartType", "Chart View",
+                        choices = c("Trend by Drill", "Velocity Distribution", "Weight vs Velocity", "PR Timeline"),
+                        selected = "Trend by Drill"
+                      )
+                    )
+                  ),
+                  column(
+                    9,
+                    uiOutput("manualVeloKpis"),
+                    plotOutput("manualVeloPlot", height = "480px"),
+                    br(),
+                    DT::dataTableOutput("manualVeloSummaryTable")
+                  )
+                )
+              )
+            )
+          )
+          
+          , tabPanel(
             "Stuff+ Calculator",
             value = "stuff_calc",
             fluidRow(
@@ -7374,9 +7985,7 @@ mod_hit_ui <- function(id, show_header = FALSE) {
         ),
         selectInput(
           ns("zoneLoc"), "Zone Location:",
-          choices = c("All",
-                      "Upper Half","Bottom Half","Left Half","Right Half",
-                      "Upper 3rd","Bottom 3rd","Left 3rd","Right 3rd"),
+          choices = pitching_zone_location_choices,
           selected = "All",
           multiple = TRUE
         ),
@@ -7567,6 +8176,10 @@ safe_for_dt <- function(df) {
     else if (is.matrix(col)) apply(col, 1, paste, collapse = ", ")
     else col
   })
+  name_cols <- intersect(c("Pitcher", "Batter", "Catcher", "Hitter", "Player"), names(out))
+  for (nm in name_cols) {
+    out[[nm]] <- format_name_first_last(out[[nm]])
+  }
   as.data.frame(out, stringsAsFactors = FALSE, check.names = FALSE)
 }
 
@@ -7669,7 +8282,7 @@ mod_hit_server <- function(id, is_active = shiny::reactive(TRUE), global_date_ra
         }
         if ("Session Type" %in% sel) {
           out <- c(out, list(
-            selectInput(ns(paste0("cell_session_", cell_id)), "Session Type:", choices = session_type_choices(), selected = "Season")
+            selectInput(ns(paste0("cell_session_", cell_id)), "Session Type:", choices = session_type_choices(), selected = "All")
           ))
         }
         if ("Pitch Types" %in% sel) {
@@ -7719,8 +8332,7 @@ mod_hit_server <- function(id, is_active = shiny::reactive(TRUE), global_date_ra
         if ("Zone Location" %in% sel) {
           out <- c(out, list(
             selectInput(ns(paste0("cell_zone_", cell_id)), "Zone Location:", choices = c("All",
-                                                                                         "Upper Half","Bottom Half","Left Half","Right Half",
-                                                                                         "Upper 3rd","Bottom 3rd","Left 3rd","Right 3rd"),
+                                                                                         pitching_zone_location_choices[-1]),
                         selected = "All", multiple = TRUE)
           ))
         }
@@ -7902,15 +8514,15 @@ mod_hit_server <- function(id, is_active = shiny::reactive(TRUE), global_date_ra
         x=c(-0.75,0.75,0.75,0.00,-0.75),
         y=c(1.05,1.05,1.15,1.25,1.15)-0.5
       )
-      cz <- data.frame(xmin = -1.5, xmax = 1.5, ymin = 2.65 - 1.5, ymax = 2.65 + 1.5)
+      cz <- data.frame(xmin = -1.5, xmax = 1.5, ymin = ((ZONE_BOTTOM + ZONE_TOP) / 2) - 1.5, ymax = ((ZONE_BOTTOM + ZONE_TOP) / 2) + 1.5)
       sz <- data.frame(xmin = ZONE_LEFT, xmax = ZONE_RIGHT, ymin = ZONE_BOTTOM, ymax = ZONE_TOP)
-      list(
+      c(list(
         geom_polygon(data = home, aes(x, y), fill = NA, color = line_col),
         geom_rect(data = cz, aes(xmin = xmin, xmax = xmax, ymin = ymin, ymax = ymax),
                   fill = NA, color = line_col, linetype = "dashed"),
         geom_rect(data = sz, aes(xmin = xmin, xmax = xmax, ymin = ymin, ymax = ymax),
                   fill = NA, color = line_col)
-      )
+      ), zone_nine_square_layers(color = line_col))
     }
     
     # ---------- AB Report: date choices + default ----------
@@ -8034,10 +8646,18 @@ mod_hit_server <- function(id, is_active = shiny::reactive(TRUE), global_date_ra
       # ---------- CHART grid (2 per row) ----------
       chart_rows <- list()
       for (i in seq_len(n_pa)) {
-        dat <- pa_list[[i]] %>% dplyr::mutate(
+        pa_i <- pa_list[[i]]
+        n_i <- nrow(pa_i)
+        if (!"ExitSpeed" %in% names(pa_i)) pa_i$ExitSpeed <- rep(NA_real_, n_i)
+        if (!"Angle" %in% names(pa_i)) pa_i$Angle <- rep(NA_real_, n_i)
+        if (!"Distance" %in% names(pa_i)) pa_i$Distance <- rep(NA_real_, n_i)
+        dat <- pa_i %>% dplyr::mutate(
           pitch_idx = dplyr::row_number(),
           Result    = factor(compute_result(PitchCall, PlayResult), levels = result_levels),
           tt_fill   = dplyr::coalesce(colors_for_mode(is_dark_mode())[as.character(TaggedPitchType)], "gray80"),
+          ExitSpeed = suppressWarnings(as.numeric(ExitSpeed)),
+          Angle     = suppressWarnings(as.numeric(Angle)),
+          Distance  = suppressWarnings(as.numeric(Distance)),
           tt        = paste0(
             "EV: ", ifelse(is.finite(ExitSpeed), sprintf("%.1f", ExitSpeed), "—"), " mph\n",
             "LA: ", ifelse(is.finite(Angle),     sprintf("%.1f", Angle),     "—"), "°\n",
@@ -8139,7 +8759,17 @@ mod_hit_server <- function(id, is_active = shiny::reactive(TRUE), global_date_ra
         out_table_id <- ns(paste0("abTable_", pid))
         
         local({
-          dat_local <- pa_list[[i]] %>% dplyr::mutate(pitch_idx = dplyr::row_number())
+          pa_tbl <- pa_list[[i]]
+          n_tbl <- nrow(pa_tbl)
+          if (!"ExitSpeed" %in% names(pa_tbl)) pa_tbl$ExitSpeed <- rep(NA_real_, n_tbl)
+          if (!"Angle" %in% names(pa_tbl)) pa_tbl$Angle <- rep(NA_real_, n_tbl)
+          if (!"Distance" %in% names(pa_tbl)) pa_tbl$Distance <- rep(NA_real_, n_tbl)
+          dat_local <- pa_tbl %>% dplyr::mutate(
+            pitch_idx = dplyr::row_number(),
+            ExitSpeed = suppressWarnings(as.numeric(ExitSpeed)),
+            Angle     = suppressWarnings(as.numeric(Angle)),
+            Distance  = suppressWarnings(as.numeric(Distance))
+          )
           out_table_id_local <- paste0("abTable_", pid)
           output[[out_table_id_local]] <- DT::renderDT({
             tbl <- dat_local %>% dplyr::transmute(
@@ -8366,7 +8996,7 @@ mod_hit_server <- function(id, is_active = shiny::reactive(TRUE), global_date_ra
       user_changed_dates(TRUE)
     }, ignoreInit = TRUE)
     
-    # Default date range to last date for selected hitter (LSU only)
+    # Default date range to a recent window for selected hitter (LSU only)
     # Only update if user hasn't manually changed dates
     observeEvent(input$hitter, {
       req(is_active())
@@ -8375,14 +9005,14 @@ mod_hit_server <- function(id, is_active = shiny::reactive(TRUE), global_date_ra
       if (user_changed_dates()) return()
       
       d <- pd_team()
-      last_date <- if (isTRUE(input$hitter == "All")) {
-        max(d$Date, na.rm = TRUE)
+      date_pool <- if (isTRUE(input$hitter == "All")) {
+        d$Date
       } else {
-        mx <- max(d$Date[d$Batter == input$hitter], na.rm = TRUE)
-        if (is.finite(mx)) mx else max(d$Date, na.rm = TRUE)
+        d$Date[d$Batter == input$hitter]
       }
-      if (is.finite(last_date)) {
-        updateDateRangeInput(session, "dates", start = last_date, end = last_date)
+      win <- recent_date_window(date_pool, n_days = 7L)
+      if (!is.null(win)) {
+        updateDateRangeInput(session, "dates", start = win[[1]], end = win[[2]])
       }
     }, ignoreInit = TRUE)
     
@@ -8657,7 +9287,7 @@ mod_hit_server <- function(id, is_active = shiny::reactive(TRUE), global_date_ra
       
       home <- data.frame(x=c(-0.75,0.75,0.75,0.00,-0.75),
                          y=c(1.05,1.05,1.15,1.25,1.15)-0.5)
-      cz <- data.frame(xmin = -1.5, xmax = 1.5, ymin = 2.65 - 1.5, ymax = 2.65 + 1.5)
+      cz <- data.frame(xmin = -1.5, xmax = 1.5, ymin = ((ZONE_BOTTOM + ZONE_TOP) / 2) - 1.5, ymax = ((ZONE_BOTTOM + ZONE_TOP) / 2) + 1.5)
       sz <- data.frame(xmin = ZONE_LEFT, xmax = ZONE_RIGHT, ymin = ZONE_BOTTOM, ymax = ZONE_TOP)
       
       df_known <- dplyr::filter(df_i, !is.na(Result))
@@ -8669,6 +9299,7 @@ mod_hit_server <- function(id, is_active = shiny::reactive(TRUE), global_date_ra
                   fill = NA, color = line_col, linetype = "dashed") +
         geom_rect(data = sz, aes(xmin = xmin, xmax = xmax, ymin = ymin, ymax = ymax),
                   fill = NA, color = line_col) +
+        zone_nine_square_layers(color = line_col) +
         ggiraph::geom_point_interactive(
           data = df_other,
           aes(PlateLocSide, PlateLocHeight,
@@ -8812,9 +9443,19 @@ mod_hit_server <- function(id, is_active = shiny::reactive(TRUE), global_date_ra
       st <- tolower(trimws(as.character(df$SessionType)))
       live_mask <- grepl("live|game|ab", st)
       
-      # Require in-play with numeric distance/direction
-      dist_num <- suppressWarnings(as.numeric(df$Distance))
-      dir_num  <- suppressWarnings(as.numeric(df$Direction))
+      # Require in-play with numeric distance/direction (fallback to legacy fields when needed)
+      dist_src <- if ("Distance" %in% names(df)) df$Distance else rep(NA, nrow(df))
+      if ("LastTrackedDistance" %in% names(df)) {
+        use_last <- !is.finite(suppressWarnings(as.numeric(dist_src)))
+        dist_src[use_last] <- df$LastTrackedDistance[use_last]
+      }
+      dir_src <- if ("Direction" %in% names(df)) df$Direction else rep(NA, nrow(df))
+      if ("Bearing" %in% names(df)) {
+        use_bearing <- !is.finite(suppressWarnings(as.numeric(dir_src)))
+        dir_src[use_bearing] <- df$Bearing[use_bearing]
+      }
+      dist_num <- suppressWarnings(as.numeric(dist_src))
+      dir_num  <- suppressWarnings(as.numeric(dir_src))
       ok <- which(live_mask & df$PitchCall == "InPlay" &
                     is.finite(dist_num) & is.finite(dir_num))
       
@@ -8974,7 +9615,7 @@ mod_hit_server <- function(id, is_active = shiny::reactive(TRUE), global_date_ra
             ),
             selectInput(
               ns("dpSplitBy"), label = NULL,
-              choices = c("Pitch Types", "Pitcher Hand", "Count", "After Count", "Velocity", "IVB", "HB", "Pitcher"),
+              choices = hitting_split_by_choices,
               selected = "Pitch Types",
               width = "140px"
             )
@@ -9025,10 +9666,13 @@ mod_hit_server <- function(id, is_active = shiny::reactive(TRUE), global_date_ra
           "Pitcher Hand" = "Pitcher Hand",
           "Count" = "Count",
           "After Count" = "After Count",
+          "Zone Location" = "Zone Location",
+          "Times Through Order" = "Times Through Order",
           "Velocity" = "Velocity",
           "IVB" = "InducedVert",
           "HB" = "HorzBreak",
           "Pitcher" = "Pitcher",
+          "Catcher" = "Catcher",
           "Pitch"  # default
         )
         
@@ -9204,6 +9848,19 @@ mod_hit_server <- function(id, is_active = shiny::reactive(TRUE), global_date_ra
             wOBA = safe_div(wOBA_num, wOBA_den)
           )
         
+        # Guard optional columns so summary tables still render when source files omit them
+        for (nm in c("ExitSpeed", "Angle", "RelSpeed", "InducedVertBreak", "HorzBreak", "Distance", "RunsScored", "PlateLocSide", "PlateLocHeight")) {
+          if (!nm %in% names(df)) df[[nm]] <- NA_real_
+        }
+        for (nm in c("SessionType", "PitchCall", "TaggedHitType", "Balls", "Strikes")) {
+          if (!nm %in% names(df)) df[[nm]] <- NA
+        }
+        df <- df %>%
+          dplyr::mutate(
+            Distance_num = suppressWarnings(as.numeric(Distance)),
+            RunsScored_num = suppressWarnings(as.numeric(RunsScored))
+          )
+        
         # Calculate raw barrel counts per split
         barrel_counts <- df %>%
           dplyr::filter(
@@ -9247,9 +9904,9 @@ mod_hit_server <- function(id, is_active = shiny::reactive(TRUE), global_date_ra
             Velo = mean(RelSpeed, na.rm = TRUE),
             IVB = mean(InducedVertBreak, na.rm = TRUE),
             HB = mean(HorzBreak, na.rm = TRUE),
-            Distance = mean(suppressWarnings(as.numeric(Distance[SessionType == "Live" & PitchCall == "InPlay"])), na.rm = TRUE),
+            Distance = mean(Distance_num[SessionType == "Live" & PitchCall == "InPlay"], na.rm = TRUE),
             `RV/100` = {
-              rv <- sum(suppressWarnings(as.numeric(RunsScored)), na.rm = TRUE)
+              rv <- sum(RunsScored_num, na.rm = TRUE)
               safe_div(rv * 100, dplyr::n())
             },
             .groups = "drop"
@@ -9493,8 +10150,8 @@ mod_hit_server <- function(id, is_active = shiny::reactive(TRUE), global_date_ra
         all_row$Velo <- mean(df$RelSpeed, na.rm = TRUE)
         all_row$IVB <- mean(df$InducedVertBreak, na.rm = TRUE)
         all_row$HB <- mean(df$HorzBreak, na.rm = TRUE)
-        all_row$Distance <- mean(suppressWarnings(as.numeric(df$Distance[df$SessionType == "Live" & df$PitchCall == "InPlay"])), na.rm = TRUE)
-        all_row$`RV/100` <- safe_div(sum(suppressWarnings(as.numeric(df$RunsScored)), na.rm = TRUE) * 100, nrow(df))
+        all_row$Distance <- mean(df$Distance_num[df$SessionType == "Live" & df$PitchCall == "InPlay"], na.rm = TRUE)
+        all_row$`RV/100` <- safe_div(sum(df$RunsScored_num, na.rm = TRUE) * 100, nrow(df))
         
         # Discipline stats for All row
         first_pitch_all <- sum(df$Balls == 0 & df$Strikes == 0, na.rm = TRUE)
@@ -10089,19 +10746,18 @@ mod_hit_server <- function(id, is_active = shiny::reactive(TRUE), global_date_ra
         )
       }, error = function(e) {
         # Provide detailed error information for debugging
-        error_msg <- conditionMessage(e)
-        error_details <- paste(
-          "Detailed error in Hitting dpTable:",
-          "Error:", error_msg,
-          "Call stack available in R console",
-          sep = "\n"
-        )
+        error_msg <- trimws(conditionMessage(e) %||% "")
+        if (!nzchar(error_msg)) {
+          error_msg <- paste(capture.output(str(e)), collapse = " ")
+        }
+        if (!nzchar(error_msg)) {
+          error_msg <- "Unknown hitting table error"
+        }
         
         # Log the full error for debugging
         cat("Hitting dpTable error:\n")
         cat("Message:", error_msg, "\n")
-        cat("Traceback:\n")
-        traceback()
+        cat("Error class:", paste(class(e), collapse = ","), "\n")
         
         DT::datatable(
           data.frame(
@@ -10122,14 +10778,14 @@ mod_hit_server <- function(id, is_active = shiny::reactive(TRUE), global_date_ra
         showNotification("Please enter a name and choose at least one column.", type = "warning")
         return()
       }
-      # Get is_admin function safely
-      is_admin_fun <- get0("is_admin", mode = "function", inherits = TRUE)
-      is_admin_val <- if (!is.null(is_admin_fun)) {
-        tryCatch(is_admin_fun(), error = function(e) FALSE)
+      # Get can_share_global function safely
+      can_share_global_fun <- get0("can_share_global", mode = "function", inherits = TRUE)
+      can_share_global_val <- if (!is.null(can_share_global_fun)) {
+        tryCatch(can_share_global_fun(), error = function(e) FALSE)
       } else {
         FALSE
       }
-      scope <- if (isTRUE(is_admin_val) && isTRUE(input$dpCustomGlobal)) GLOBAL_SCOPE else current_school()
+      scope <- if (isTRUE(can_share_global_val) && isTRUE(input$dpCustomGlobal)) GLOBAL_SCOPE else current_school()
       ct <- custom_tables()
       ct[[nm]] <- list(cols = cols, school_code = scope)
       custom_tables(ct)
@@ -10144,6 +10800,17 @@ mod_hit_server <- function(id, is_active = shiny::reactive(TRUE), global_date_ra
       if (!nzchar(nm)) return()
       ct <- custom_tables()
       if (nm %in% names(ct)) {
+        item_scope <- toupper(trimws(as.character(ct[[nm]]$school_code %||% current_school())))
+        can_share_global_fun <- get0("can_share_global", mode = "function", inherits = TRUE)
+        can_share_global_val <- if (!is.null(can_share_global_fun)) {
+          tryCatch(can_share_global_fun(), error = function(e) FALSE)
+        } else {
+          FALSE
+        }
+        if (identical(item_scope, GLOBAL_SCOPE) && !isTRUE(can_share_global_val)) {
+          showNotification("Only jgaynor@pitchingcoachu.com can delete global custom tables.", type = "error")
+          return()
+        }
         ct[[nm]] <- NULL
         custom_tables(ct)
         save_custom_tables(ct)
@@ -10187,11 +10854,7 @@ mod_hit_server <- function(id, is_active = shiny::reactive(TRUE), global_date_ra
 
 # --- C) Build catcher_map (just after batter_map is created) ---
 raw_catchers <- sort(unique(na.omit(as.character(pitch_data$Catcher))))
-catch_display <- ifelse(
-  grepl(",", raw_catchers),
-  vapply(strsplit(raw_catchers, ",\\s*"), function(x) paste(x[2], x[1]), ""),
-  raw_catchers
-)
+catch_display <- format_name_first_last(raw_catchers)
 catcher_map <- setNames(raw_catchers, catch_display)
 
 
@@ -10222,7 +10885,7 @@ mod_catch_ui <- function(id, show_header = FALSE) {
     sidebarLayout(
       sidebarPanel(
         # Exact same main sidebar as Pitching, but with Catcher selector
-        selectInput(ns("sessionType"), "Session Type:", choices = session_type_choices(), selected = "Season"),
+        selectInput(ns("sessionType"), "Session Type:", choices = session_type_choices(), selected = "All"),
         selectInput(ns("catcher"), "Select Catcher:", choices = c("All" = "All", catcher_map), selected = "All"),
         selectInput(
           ns("teamType"), "Team:",
@@ -10238,9 +10901,7 @@ mod_catch_ui <- function(id, show_header = FALSE) {
                     choices = c("All", levels(pitch_data$TaggedPitchType)), selected = "All", multiple = TRUE),
         selectInput(
           ns("zoneLoc"), "Zone Location:",
-          choices = c("All",
-                      "Upper Half","Bottom Half","Left Half","Right Half",
-                      "Upper 3rd","Bottom 3rd","Left 3rd","Right 3rd"),
+          choices = pitching_zone_location_choices,
           selected = "All",
           multiple = TRUE
         ),
@@ -10432,17 +11093,17 @@ mod_catch_server <- function(id, is_active = shiny::reactive(TRUE), global_date_
       }
     }, ignoreInit = TRUE)
     
-    # Default dates to last date for selected catcher (or global last)
+    # Default dates to a recent window for selected catcher.
     observeEvent(input$catcher, {
       req(is_active())
-      last_date <- if (isTRUE(input$catcher == "All")) {
-        max(pitch_data$Date, na.rm = TRUE)
+      date_pool <- if (isTRUE(input$catcher == "All")) {
+        pitch_data$Date
       } else {
-        mx <- max(pitch_data$Date[pitch_data$Catcher == input$catcher], na.rm = TRUE)
-        if (is.finite(mx)) mx else max(pitch_data$Date, na.rm = TRUE)
+        pitch_data$Date[pitch_data$Catcher == input$catcher]
       }
-      if (is.finite(last_date)) {
-        updateDateRangeInput(session, "dates", start = last_date, end = last_date)
+      win <- recent_date_window(date_pool, n_days = 7L)
+      if (!is.null(win)) {
+        updateDateRangeInput(session, "dates", start = win[[1]], end = win[[2]])
       }
     }, ignoreInit = TRUE)
     
@@ -10588,6 +11249,9 @@ mod_catch_server <- function(id, is_active = shiny::reactive(TRUE), global_date_
       }
       
       to_num <- function(x) suppressWarnings(as.numeric(x))
+      for (nm in c("ThrowSpeed", "ExchangeTime", "PopTime")) {
+        if (!nm %in% names(df_all)) df_all[[nm]] <- NA_real_
+      }
       
       # ---------- SL+ on TAKES from the full dataset ----------
       # Safe logical operations for takes calculation
@@ -10816,6 +11480,9 @@ mod_catch_server <- function(id, is_active = shiny::reactive(TRUE), global_date_
     loc_throws <- reactive({
       df <- filtered_catch()
       if (!nrow(df)) return(df[0, , drop=FALSE])
+      for (nm in c("PopTime", "ThrowSpeed")) {
+        if (!nm %in% names(df)) df[[nm]] <- NA_real_
+      }
       
       # Only rows with PopTime AND ThrowSpeed ≥ 70 mph are considered throws
       df$PopTime_num     <- loc_to_num(df$PopTime)
@@ -11088,7 +11755,7 @@ mod_catch_server <- function(id, is_active = shiny::reactive(TRUE), global_date_
       
       # Overlays (same geometry you use elsewhere)
       home <- data.frame(x = c(-0.75,0.75,0.75,0.00,-0.75), y = c(1.05,1.05,1.15,1.25,1.15) - 0.5)
-      cz   <- data.frame(xmin = -1.5, xmax =  1.5, ymin = 2.65 - 1.5, ymax = 2.65 + 1.5)
+      cz   <- data.frame(xmin = -1.5, xmax =  1.5, ymin = ((ZONE_BOTTOM + ZONE_TOP) / 2) - 1.5, ymax = ((ZONE_BOTTOM + ZONE_TOP) / 2) + 1.5)
       sz   <- data.frame(xmin = ZONE_LEFT, xmax = ZONE_RIGHT, ymin = ZONE_BOTTOM, ymax = ZONE_TOP)
       
       cols <- .safe_heat_cols(256)
@@ -11102,6 +11769,7 @@ mod_catch_server <- function(id, is_active = shiny::reactive(TRUE), global_date_
                   fill = NA, color = line_col, linetype = "dashed", linewidth = 0.6) +
         geom_rect(data = sz, aes(xmin = xmin, xmax = xmax, ymin = ymin, ymax = ymax),
                   fill = NA, color = line_col, linewidth = 0.8) +
+        zone_nine_square_layers(color = line_col, linewidth = 0.45) +
         coord_fixed(ratio = 1, xlim = c(lims[1], lims[2]), ylim = c(lims[3], lims[4])) +
         labs(title = "Called-Strike%", x = NULL, y = NULL) +
         theme_void() +
@@ -11129,7 +11797,7 @@ mod_catch_server <- function(id, is_active = shiny::reactive(TRUE), global_date_
                                    Result = factor(compute_result(PitchCall, PlayResult), levels = result_levels))
       
       home <- data.frame(x=c(-0.75,0.75,0.75,0.00,-0.75), y=c(1.05,1.05,1.15,1.25,1.15)-0.5)
-      cz   <- data.frame(xmin = -1.5, xmax = 1.5, ymin = 2.65 - 1.5, ymax = 2.65 + 1.5)
+      cz   <- data.frame(xmin = -1.5, xmax = 1.5, ymin = ((ZONE_BOTTOM + ZONE_TOP) / 2) - 1.5, ymax = ((ZONE_BOTTOM + ZONE_TOP) / 2) + 1.5)
       sz   <- data.frame(xmin = ZONE_LEFT, xmax = ZONE_RIGHT, ymin = ZONE_BOTTOM, ymax = ZONE_TOP)
       
       df_known <- dplyr::filter(df_i, !is.na(Result))
@@ -11139,6 +11807,7 @@ mod_catch_server <- function(id, is_active = shiny::reactive(TRUE), global_date_
         geom_polygon(data = home, aes(x, y), fill = NA, color = line_col) +
         geom_rect(data = cz, aes(xmin = xmin, xmax = xmax, ymin = ymin, ymax = ymax), fill = NA, color = line_col, linetype = "dashed") +
         geom_rect(data = sz, aes(xmin = xmin, xmax = xmax, ymin = ymin, ymax = ymax), fill = NA, color = line_col) +
+        zone_nine_square_layers(color = line_col) +
         ggiraph::geom_point_interactive(
           data = df_other,
           aes(PlateLocSide, PlateLocHeight, color = TaggedPitchType, fill = TaggedPitchType, tooltip = tt, data_id = rid),
@@ -11187,9 +11856,7 @@ mod_camps_ui <- function(id, show_header = FALSE) {
         selectInput(ns("pitchType"),  "Pitch Type:",    choices = "All", selected = "All", multiple = TRUE),
         selectInput(
           ns("zoneLoc"), "Zone Location:",
-          choices = c("All",
-                      "Upper Half","Bottom Half","Left Half","Right Half",
-                      "Upper 3rd","Bottom 3rd","Left 3rd","Right 3rd"),
+          choices = pitching_zone_location_choices,
           selected = "All", multiple = TRUE
         ),
         selectInput(ns("inZone"),     "In Zone:",       choices = c("All","Yes","No","Competitive"), selected = "All"),
@@ -12033,7 +12700,7 @@ mod_camps_server <- function(id, is_active = shiny::reactive(TRUE)) {
       
       home <- data.frame(x=c(-0.75,0.75,0.75,0.00,-0.75),
                          y=c(1.05,1.05,1.15,1.25,1.15)-0.5)
-      cz <- data.frame(xmin = -1.5, xmax = 1.5, ymin = 2.65 - 1.5, ymax = 2.65 + 1.5)
+      cz <- data.frame(xmin = -1.5, xmax = 1.5, ymin = ((ZONE_BOTTOM + ZONE_TOP) / 2) - 1.5, ymax = ((ZONE_BOTTOM + ZONE_TOP) / 2) + 1.5)
       sz <- data.frame(xmin = ZONE_LEFT, xmax = ZONE_RIGHT, ymin = ZONE_BOTTOM, ymax = ZONE_TOP)
       
       p <- ggplot() +
@@ -12042,6 +12709,7 @@ mod_camps_server <- function(id, is_active = shiny::reactive(TRUE)) {
                   fill = NA, color = line_col, linetype = "dashed") +
         geom_rect(data = sz, aes(xmin = xmin, xmax = xmax, ymin = ymin, ymax = ymax),
                   fill = NA, color = line_col) +
+        zone_nine_square_layers(color = line_col) +
         ggiraph::geom_point_interactive(
           data = df,
           aes(PlateLocSide, PlateLocHeight, color = TaggedPitchType,
@@ -12074,7 +12742,7 @@ mod_camps_server <- function(id, is_active = shiny::reactive(TRUE)) {
       build_row <- function(df) {
         safe_pct <- function(num, den) {
           num <- suppressWarnings(as.numeric(num)); den <- suppressWarnings(as.numeric(den))
-          ifelse(is.finite(den) & den > 0 & is.finite(num), paste0(round(100*num/den, 1), "%"), "")
+          fmt_pct_ratio(num, den, digits = 1)
         }
         scores <- ifelse(
           df$PlateLocSide >= ZONE_LEFT & df$PlateLocSide <= ZONE_RIGHT &
@@ -12228,8 +12896,18 @@ mod_camps_server <- function(id, is_active = shiny::reactive(TRUE)) {
       st <- tolower(trimws(as.character(df$SessionType)))
       live_mask <- grepl("live|game|ab", st)
       
-      dist_num <- suppressWarnings(as.numeric(df$Distance))
-      dir_num  <- suppressWarnings(as.numeric(df$Direction))
+      dist_src <- if ("Distance" %in% names(df)) df$Distance else rep(NA, nrow(df))
+      if ("LastTrackedDistance" %in% names(df)) {
+        use_last <- !is.finite(suppressWarnings(as.numeric(dist_src)))
+        dist_src[use_last] <- df$LastTrackedDistance[use_last]
+      }
+      dir_src <- if ("Direction" %in% names(df)) df$Direction else rep(NA, nrow(df))
+      if ("Bearing" %in% names(df)) {
+        use_bearing <- !is.finite(suppressWarnings(as.numeric(dir_src)))
+        dir_src[use_bearing] <- df$Bearing[use_bearing]
+      }
+      dist_num <- suppressWarnings(as.numeric(dist_src))
+      dir_num  <- suppressWarnings(as.numeric(dir_src))
       ok <- which(live_mask & df$PitchCall == "InPlay" & is.finite(dist_num) & is.finite(dir_num))
       
       fence_pts <- data.frame(deg = c(-45,-22.5,0,22.5,45), r = c(330,370,400,370,330))
@@ -12471,6 +13149,9 @@ mod_camps_server <- function(id, is_active = shiny::reactive(TRUE)) {
       }
       
       to_num <- function(x) suppressWarnings(as.numeric(x))
+      for (nm in c("ThrowSpeed", "ExchangeTime", "PopTime")) {
+        if (!nm %in% names(df_all)) df_all[[nm]] <- NA_real_
+      }
       takes_all   <- tryCatch({
         pitch_call_safe <- as.character(df_all$PitchCall)
         (!is.na(pitch_call_safe)) & (pitch_call_safe %in% c("StrikeCalled","BallCalled"))
@@ -12578,7 +13259,7 @@ mod_leader_ui <- function(id, show_header = FALSE) {
         selectInput(ns("teamType"), "Team:", choices = TEAM_CHOICES, selected = "All"),
         
         # --- Common filters (apply to all domains) ---
-        selectInput(ns("sessionType"), "Session Type:", choices = session_type_choices(), selected = "Season"),
+        selectInput(ns("sessionType"), "Session Type:", choices = session_type_choices(), selected = "All"),
         dateRangeInput(ns("dates"), "Date Range:",
                        start = max(pitch_data$Date, na.rm = TRUE),
                        end   = max(pitch_data$Date, na.rm = TRUE),
@@ -12587,9 +13268,7 @@ mod_leader_ui <- function(id, show_header = FALSE) {
         selectInput(ns("pitchType"),  "Pitch Type:",    choices = c("All", levels(pitch_data$TaggedPitchType)), selected = "All", multiple = TRUE),
         selectInput(
           ns("zoneLoc"), "Zone Location:",
-          choices = c("All",
-                      "Upper Half","Bottom Half","Left Half","Right Half",
-                      "Upper 3rd","Bottom 3rd","Left 3rd","Right 3rd"),
+          choices = pitching_zone_location_choices,
           selected = "All", multiple = TRUE
         ),
         selectInput(ns("inZone"),     "In Zone:",       choices = c("All","Yes","No","Competitive"), selected = "All"),
@@ -12763,13 +13442,13 @@ mod_leader_server <- function(id, is_active = shiny::reactive(TRUE), global_date
     })
     
     
-    # Default the date range to the most recent date with data for the chosen domain/sessionType
+    # Default the date range to a recent window with data for the chosen domain/sessionType
     observe({
       req(is_active())
       base <- team_base()
-      last_date <- suppressWarnings(max(base$Date, na.rm = TRUE))
-      if (is.finite(last_date)) {
-        updateDateRangeInput(session, "dates", start = last_date, end = last_date)
+      win <- recent_date_window(base$Date, n_days = 7L)
+      if (!is.null(win)) {
+        updateDateRangeInput(session, "dates", start = win[[1]], end = win[[2]])
       }
     })
     
@@ -12899,6 +13578,7 @@ mod_leader_server <- function(id, is_active = shiny::reactive(TRUE), global_date
       
       df <- df %>% dplyr::filter(!is.na(.data[[player_col]]) & nzchar(.data[[player_col]]))
       by_player <- split(df, df[[player_col]])
+      by_player <- c(list(All = df), by_player)
       
       res_mode <- resolve_table_mode_global(input$lbMode, input$lbCustomCols)
       mode <- res_mode$mode
@@ -12919,7 +13599,8 @@ mod_leader_server <- function(id, is_active = shiny::reactive(TRUE), global_date
           }
         }
         
-        rows <- lapply(by_player, function(dfi) {
+        rows <- lapply(names(by_player), function(player_name) {
+          dfi <- by_player[[player_name]]
           all_ip <- ip_calculation(dfi)
           all_p <- nrow(dfi)
           # Completed BF calculation (shared)
@@ -12943,7 +13624,7 @@ mod_leader_server <- function(id, is_active = shiny::reactive(TRUE), global_date
           p_per_bf <- if (all_bf > 0) as.character(round(all_p / all_bf, 1)) else ""
           
           tibble::tibble(
-            Player = as.character(dfi[[player_col]][1]),
+            Player = player_name,
             IP = all_ip,
             P = all_p,
             BF = all_bf,
@@ -12971,7 +13652,8 @@ mod_leader_server <- function(id, is_active = shiny::reactive(TRUE), global_date
             remember        = FALSE,
             default_visible = visible_set,
             mode            = "Raw Data",
-            enable_colors   = use_colors
+            enable_colors   = use_colors,
+            pin_all_row     = TRUE
           )
         }, error = function(e) {
           message("lbTable Raw Data error: ", conditionMessage(e))
@@ -12996,7 +13678,7 @@ mod_leader_server <- function(id, is_active = shiny::reactive(TRUE), global_date
           }
           safe_pct <- function(num, den) {
             num <- suppressWarnings(as.numeric(num)); den <- suppressWarnings(as.numeric(den))
-            out <- ifelse(is.finite(den) & den > 0 & is.finite(num), paste0(round(100*num/den, 1), "%"), "")
+            out <- fmt_pct_ratio(num, den, digits = 1)
             scalar_chr(out)
           }
           nz_mean_local <- function(x) {
@@ -13099,7 +13781,8 @@ mod_leader_server <- function(id, is_active = shiny::reactive(TRUE), global_date
         
         original_data <- if (identical(mode, "Usage")) filtered_lb_before_pitch_type() else NULL
         
-        rows <- lapply(by_player, function(dfi) {
+        rows <- lapply(names(by_player), function(player_name) {
+          dfi <- by_player[[player_name]]
           # Flatten any list-cols that break downstream summaries
           dfi <- dfi %>% dplyr::mutate(dplyr::across(where(is.list), ~unlist(.x)))
           base_row <- build_all_row(dfi)
@@ -13136,15 +13819,19 @@ mod_leader_server <- function(id, is_active = shiny::reactive(TRUE), global_date
             }
           }
           out_row <- dplyr::bind_cols(
-            tibble::tibble(Player = as.character(dfi[[player_col]][1])),
+            tibble::tibble(Player = player_name),
             base_row,
             extras_all
           )
           if (identical(mode, "Usage")) {
-            player_val <- as.character(dfi[[player_col]][1])
-            original_player <- if (!is.null(original_data)) {
+            original_player <- if (is.null(original_data)) {
+              NULL
+            } else if (identical(player_name, "All")) {
+              original_data
+            } else {
+              player_val <- player_name
               original_data[original_data[[player_col]] == player_val, , drop = FALSE]
-            } else NULL
+            }
             usage_cols <- compute_usage_by_count(dfi, original_player) %>%
               dplyr::filter(tolower(PitchType) == "all") %>%
               dplyr::select(`0-0`,`Behind`,`Even`,`Ahead`,`<2K`,`2K`)
@@ -13220,7 +13907,8 @@ mod_leader_server <- function(id, is_active = shiny::reactive(TRUE), global_date
           lock            = "Player",
           remember        = FALSE,
           default_visible = intersect(visible_set, names(out_tbl)),
-          mode            = mode
+          mode            = mode,
+          pin_all_row     = TRUE
         )
       } # End of else block for normal modes
     }, server = FALSE)
@@ -13272,8 +13960,10 @@ mod_leader_server <- function(id, is_active = shiny::reactive(TRUE), global_date
       
       swing_levels <- c("StrikeSwinging","FoulBallNotFieldable","FoulBallFieldable","InPlay")
       by_batter <- split(df, df$Batter)
+      by_batter <- c(list(All = df), by_batter)
       
-      results_rows <- lapply(by_batter, function(dfi) {
+      results_rows <- lapply(names(by_batter), function(player_name) {
+        dfi <- by_batter[[player_name]]
         # Terminal rows = completed PA for THIS batter
         is_term_i <- (
           (!is.na(dfi$PlayResult) & dfi$PlayResult != "Undefined") |
@@ -13336,7 +14026,7 @@ mod_leader_server <- function(id, is_active = shiny::reactive(TRUE), global_date
         }
         
         tibble::tibble(
-          Player = as.character(dfi$Batter[1]),
+          Player = player_name,
           PA  = PAt,
           AB  = ABt,
           AVG = safe_div(H_all, ABt),
@@ -13360,7 +14050,8 @@ mod_leader_server <- function(id, is_active = shiny::reactive(TRUE), global_date
       })
       
       # Swing Decisions rows per batter
-      sd_rows <- lapply(by_batter, function(dfi) {
+      sd_rows <- lapply(names(by_batter), function(player_name) {
+        dfi <- by_batter[[player_name]]
         inner_half <- 7 / 12
         mid_x <- (ZONE_LEFT + ZONE_RIGHT) / 2
         mid_y <- (ZONE_BOTTOM + ZONE_TOP) / 2
@@ -13423,7 +14114,7 @@ mod_leader_server <- function(id, is_active = shiny::reactive(TRUE), global_date
           dplyr::mutate(dplyr::across(dplyr::everything(), ~ ifelse(is.finite(.), round(.,1), NA_real_)))
         
         tibble::tibble(
-          Player = as.character(dfi$Batter[1])
+          Player = player_name
         ) %>% dplyr::bind_cols(sd_vals)
       })
       
@@ -13440,7 +14131,7 @@ mod_leader_server <- function(id, is_active = shiny::reactive(TRUE), global_date
       
       if (identical(mode, "Swing Decisions")) {
         out <- sd_tbl
-        pct_cols <- c("Swing%","FPS%","Called%","Chase%","GoZoneSw%","IZswing%","EdgeSwing%","PosSD%")
+        pct_cols <- intersect(c("Swing%","FPS%","Called%","Chase%","GoZoneSw%","IZswing%","EdgeSwing%","PosSD%"), names(out))
         out[pct_cols] <- lapply(out[pct_cols], function(z) ifelse(is.finite(z), paste0(round(z,1), "%"), ""))
         default_visible <- c("Player", pct_cols)
         if (identical(mode, "Custom")) {
@@ -13451,17 +14142,21 @@ mod_leader_server <- function(id, is_active = shiny::reactive(TRUE), global_date
           lock = "Player",
           remember = FALSE,
           default_visible = intersect(default_visible, names(out)),
-          enable_colors = FALSE
+          enable_colors = FALSE,
+          pin_all_row = TRUE
         ))
       }
       
       out <- res_tbl
+      for (nm in c("RelSpeed", "InducedVertBreak", "HorzBreak", "Distance")) {
+        if (!nm %in% names(df)) df[[nm]] <- NA_real_
+      }
       # coerce numerics (avoid backtick headaches with tidyselect)
       num_cols <- c("PA","AB","AVG","SLG","OBP","OPS","wOBA","xWOBA","ISO","xISO","BABIP",
                     "Swing%","Whiff%","GB%","K%","BB%","Barrel%","EV","LA")
       out <- out %>%
         dplyr::mutate(
-          dplyr::across(dplyr::all_of(num_cols), ~ suppressWarnings(as.numeric(.)))
+          dplyr::across(dplyr::any_of(num_cols), ~ suppressWarnings(as.numeric(.)))
         )
       
       safe_mean_numeric <- function(x) {
@@ -13507,9 +14202,9 @@ mod_leader_server <- function(id, is_active = shiny::reactive(TRUE), global_date
       out$LA <- ifelse(is.finite(out$LA), round(out$LA, 1), out$LA)
       
       # 3-dec rates (no leading 0); percents to 0–100%
-          pct_cols  <- c("Swing%","Whiff%","GB%","K%","BB%","Barrel%",
-                         "FPS%","Called-S%","Take%","Chase%","GoZoneSw%","IZswing%","EdgeSwing%","PosSD%","QP%")
-      rate_cols <- c("AVG","SLG","OBP","OPS","wOBA","xWOBA","ISO","xISO","BABIP")
+      pct_cols  <- intersect(c("Swing%","Whiff%","GB%","K%","BB%","Barrel%",
+                     "FPS%","Called-S%","Take%","Chase%","GoZoneSw%","IZswing%","EdgeSwing%","PosSD%","QP%"), names(out))
+      rate_cols <- intersect(c("AVG","SLG","OBP","OPS","wOBA","xWOBA","ISO","xISO","BABIP"), names(out))
       out[pct_cols]  <- lapply(out[pct_cols],  function(z) ifelse(is.finite(z), paste0(round(z*100,1), "%"), ""))
       out[rate_cols] <- lapply(out[rate_cols], fmt_rate3)
       
@@ -13554,7 +14249,8 @@ mod_leader_server <- function(id, is_active = shiny::reactive(TRUE), global_date
         lock            = "Player",
         remember        = FALSE,
         default_visible = intersect(default_visible, names(out)),
-        enable_colors   = FALSE
+        enable_colors   = FALSE,
+        pin_all_row     = TRUE
       )
     }, server = FALSE)
     
@@ -13598,6 +14294,9 @@ mod_leader_server <- function(id, is_active = shiny::reactive(TRUE), global_date
       }
       
       to_num <- function(x) suppressWarnings(as.numeric(x))
+      for (nm in c("ThrowSpeed", "ExchangeTime", "PopTime")) {
+        if (!nm %in% names(df_all)) df_all[[nm]] <- NA_real_
+      }
       
       # pre-compute take buckets
       takes_all   <- tryCatch({
@@ -13607,6 +14306,7 @@ mod_leader_server <- function(id, is_active = shiny::reactive(TRUE), global_date
       buckets_all <- inzone_label(df_all$PlateLocSide, df_all$PlateLocHeight)
       
       by_catcher <- split(seq_len(nrow(df_all)), df_all$Catcher)  # split by index for reuse
+      by_catcher <- c(list(All = seq_len(nrow(df_all))), by_catcher)
       
       rows <- lapply(names(by_catcher), function(name) {
         idx <- by_catcher[[name]]
@@ -13695,7 +14395,8 @@ mod_leader_server <- function(id, is_active = shiny::reactive(TRUE), global_date
         lock            = "Player",
         remember        = TRUE,
         default_visible = intersect(default_visible, names(final)),
-        enable_colors   = FALSE
+        enable_colors   = FALSE,
+        pin_all_row     = TRUE
       )
     }, server = FALSE)
     
@@ -13740,7 +14441,7 @@ mod_comp_ui <- function(id, show_header = FALSE) {
               selectInput(
                 ns("cmpA_sessionType"), "Session Type:",
                 choices  = session_type_choices(),
-                selected = "Season"
+                selected = "All"
               ),
               dateRangeInput(
                 ns("cmpA_dates"), "Date Range:",
@@ -13814,9 +14515,7 @@ mod_comp_ui <- function(id, show_header = FALSE) {
               ),
               selectInput(
                 ns("cmpA_zone"),"Zone Location:",
-                choices = c("All",
-                            "Upper Half","Bottom Half","Left Half","Right Half",
-                            "Upper 3rd","Bottom 3rd","Left 3rd","Right 3rd"),
+                choices = pitching_zone_location_choices,
                 selected = "All",
                 multiple = TRUE
               ),
@@ -13845,7 +14544,7 @@ mod_comp_ui <- function(id, show_header = FALSE) {
               selectInput(
                 ns("cmpB_sessionType"), "Session Type:",
                 choices  = session_type_choices(),
-                selected = "Season"
+                selected = "All"
               ),
               dateRangeInput(
                 ns("cmpB_dates"), "Date Range:",
@@ -13918,9 +14617,7 @@ mod_comp_ui <- function(id, show_header = FALSE) {
               ),
               selectInput(
                 ns("cmpB_zone"),"Zone Location:",
-                choices = c("All",
-                            "Upper Half","Bottom Half","Left Half","Right Half",
-                            "Upper 3rd","Bottom 3rd","Left 3rd","Right 3rd"),
+                choices = pitching_zone_location_choices,
                 selected = "All",
                 multiple = TRUE
               ),
@@ -13972,7 +14669,7 @@ mod_comp_ui <- function(id, show_header = FALSE) {
                         div(style = "margin-bottom: 2px; font-weight: bold; font-size: 12px;", "Split By:"),
                         selectInput(
                           ns("cmpA_splitBy"), label = NULL,
-                          choices = c("Pitch Types", "Batter Hand", "Count", "After Count", "Velocity", "IVB", "HB", "Batter"),
+                          choices = pitching_split_by_choices,
                           selected = "Pitch Types",
                           width = "140px"
                         )
@@ -14025,7 +14722,7 @@ mod_comp_ui <- function(id, show_header = FALSE) {
                         div(style = "margin-bottom: 2px; font-weight: bold; font-size: 12px;", "Split By:"),
                         selectInput(
                           ns("cmpB_splitBy"), label = NULL,
-                          choices = c("Pitch Types", "Batter Hand", "Count", "After Count", "Velocity", "IVB", "HB", "Batter"),
+                          choices = pitching_split_by_choices,
                           selected = "Pitch Types",
                           width = "140px"
                         )
@@ -14089,10 +14786,10 @@ mod_comp_server <- function(id, is_active = shiny::reactive(TRUE), global_date_r
       if (dom %in% c("Hitter","Catcher","Pitcher","Pitching","Hitting","Catching")) {
         if (dom %in% c("Hitter","Hitting")) {
           tbl_choices <- c("Results","Swing Decisions", nms, "Custom")
-          split_choices <- c("Pitch Types", "Pitcher Hand", "Count", "After Count", "Velocity", "IVB", "HB", "Pitcher")
+          split_choices <- hitting_split_by_choices
         } else {
           tbl_choices <- c("Stuff","Process","Results","Bullpen","Live","Usage","Raw Data", nms, "Custom")
-          split_choices <- c("Pitch Types", "Batter Hand", "Count", "After Count", "Velocity", "IVB", "HB", "Batter")
+          split_choices <- pitching_split_by_choices
         }
         updateSelectInput(session, "cmpA_tableMode", choices = tbl_choices,
                           selected = tbl_choices[[1]])
@@ -14608,7 +15305,7 @@ mod_comp_server <- function(id, is_active = shiny::reactive(TRUE), global_date_r
         )
       home <- data.frame(x = c(-0.75,0.75,0.75,0.00,-0.75),
                          y = c(1.05,1.05,1.15,1.25,1.15) - 0.5)
-      cz <- data.frame(xmin = -1.5, xmax = 1.5, ymin = 2.65 - 1.5, ymax = 2.65 + 1.5)
+      cz <- data.frame(xmin = -1.5, xmax = 1.5, ymin = ((ZONE_BOTTOM + ZONE_TOP) / 2) - 1.5, ymax = ((ZONE_BOTTOM + ZONE_TOP) / 2) + 1.5)
       sz <- data.frame(xmin = ZONE_LEFT, xmax = ZONE_RIGHT, ymin = ZONE_BOTTOM, ymax = ZONE_TOP)
       line_col <- if (dark_on) "#ffffff" else "black"
       df_known <- dplyr::filter(df_i, !is.na(Result))
@@ -14619,6 +15316,7 @@ mod_comp_server <- function(id, is_active = shiny::reactive(TRUE), global_date_r
                   inherit.aes = FALSE, fill = NA, color = line_col, linetype = "dashed") +
         geom_rect(data = sz, aes(xmin = xmin, xmax = xmax, ymin = ymin, ymax = ymax),
                   inherit.aes = FALSE, fill = NA, color = line_col) +
+        zone_nine_square_layers(color = line_col) +
         ggiraph::geom_point_interactive(
           data = df_other,
           aes(PlateLocSide, PlateLocHeight,
@@ -14706,11 +15404,14 @@ mod_comp_server <- function(id, is_active = shiny::reactive(TRUE), global_date_r
         "Pitcher Hand" = "Pitcher Hand",
         "Count" = "Count",
         "After Count" = "After Count",
+        "Zone Location" = "Zone Location",
+        "Times Through Order" = "Times Through Order",
         "Velocity" = "Velocity",
         "IVB" = "IVB",
         "HB" = "HB",
         "Batter" = if (dom == "Hitter") "Pitcher" else "Batter",
         "Pitcher" = "Pitcher",
+        "Catcher" = "Catcher",
         "Pitch"
       )
       ensure_split_column <- function(tbl) {
@@ -15500,7 +16201,7 @@ mod_comp_server <- function(id, is_active = shiny::reactive(TRUE), global_date_r
             df$PlateLocHeight >= ZONE_BOTTOM & df$PlateLocHeight <= ZONE_TOP, 1.47,
           ifelse(
             df$PlateLocSide >= -1.5 & df$PlateLocSide <= 1.5 &
-              df$PlateLocHeight >= (2.65 - 1.5) & df$PlateLocHeight <= (2.65 + 1.5),
+              df$PlateLocHeight >= (((ZONE_BOTTOM + ZONE_TOP) / 2) - 1.5) & df$PlateLocHeight <= (((ZONE_BOTTOM + ZONE_TOP) / 2) + 1.5),
             0.73, 0
           )
         )
@@ -16120,6 +16821,17 @@ mod_comp_server <- function(id, is_active = shiny::reactive(TRUE), global_date_r
       if (!nzchar(nm)) return()
       ct <- custom_tables()
       if (nm %in% names(ct)) {
+        item_scope <- toupper(trimws(as.character(ct[[nm]]$school_code %||% current_school())))
+        can_share_global_fun <- get0("can_share_global", mode = "function", inherits = TRUE)
+        can_share_global_val <- if (!is.null(can_share_global_fun)) {
+          tryCatch(can_share_global_fun(), error = function(e) FALSE)
+        } else {
+          FALSE
+        }
+        if (identical(item_scope, GLOBAL_SCOPE) && !isTRUE(can_share_global_val)) {
+          showNotification("Only jgaynor@pitchingcoachu.com can delete global custom tables.", type = "error")
+          return()
+        }
         ct[[nm]] <- NULL
         custom_tables(ct); save_custom_tables(ct); update_custom_table_choices(session)
         updateSelectInput(session, "cmpA_customSaved", choices = c("", names(ct)), selected = "")
@@ -16154,6 +16866,17 @@ mod_comp_server <- function(id, is_active = shiny::reactive(TRUE), global_date_r
       if (!nzchar(nm)) return()
       ct <- custom_tables()
       if (nm %in% names(ct)) {
+        item_scope <- toupper(trimws(as.character(ct[[nm]]$school_code %||% current_school())))
+        can_share_global_fun <- get0("can_share_global", mode = "function", inherits = TRUE)
+        can_share_global_val <- if (!is.null(can_share_global_fun)) {
+          tryCatch(can_share_global_fun(), error = function(e) FALSE)
+        } else {
+          FALSE
+        }
+        if (identical(item_scope, GLOBAL_SCOPE) && !isTRUE(can_share_global_val)) {
+          showNotification("Only jgaynor@pitchingcoachu.com can delete global custom tables.", type = "error")
+          return()
+        }
         ct[[nm]] <- NULL
         custom_tables(ct); save_custom_tables(ct); update_custom_table_choices(session)
         updateSelectInput(session, "cmpB_customSaved", choices = c("", names(ct)), selected = "")
@@ -16364,48 +17087,6 @@ custom_reports_ui <- function(id) {
   ns <- NS(id)
   fluidPage(
     shinyjs::useShinyjs(),  # Enable shinyjs
-    tags$script(HTML("
-      (function() {
-        function reflowCustomReports(rootId) {
-          var root = rootId ? document.getElementById(rootId) : null;
-          var target = root || document;
-          setTimeout(function() {
-            try { window.dispatchEvent(new Event('resize')); } catch (e) {}
-            try {
-              if (window.HTMLWidgets && typeof window.HTMLWidgets.staticRender === 'function') {
-                window.HTMLWidgets.staticRender();
-              }
-            } catch (e) {}
-            try {
-              if (window.Plotly) {
-                var plots = target.querySelectorAll('.plotly');
-                plots.forEach(function(el) { window.Plotly.Plots.resize(el); });
-              }
-            } catch (e) {}
-            try {
-              if (window.jQuery && jQuery.fn && jQuery.fn.dataTable) {
-                jQuery.fn.dataTable.tables({visible: true, api: true}).columns.adjust().draw(false);
-              }
-            } catch (e) {}
-          }, 120);
-        }
-
-        if (window.Shiny && typeof window.Shiny.addCustomMessageHandler === 'function') {
-          window.Shiny.addCustomMessageHandler('creports_force_reflow', function(message) {
-            var rootId = (message && message.rootId) ? message.rootId : null;
-            reflowCustomReports(rootId);
-            setTimeout(function() { reflowCustomReports(rootId); }, 420);
-          });
-        }
-
-        if (window.jQuery) {
-          jQuery(document).on('shown.bs.tab', 'a[data-toggle=\"tab\"]', function(e) {
-            var val = jQuery(e.target).data('value');
-            if (val === 'Custom Reports') reflowCustomReports(null);
-          });
-        }
-      })();
-    ")),
     div(
       class = "creports-root",
       # Floating show sidebar button (only visible when sidebar is hidden)
@@ -16499,34 +17180,42 @@ custom_reports_ui <- function(id) {
 custom_reports_server <- function(id) {
   moduleServer(id, function(input, output, session) {
     ns <- session$ns
-    is_admin_fun <- get0("is_admin", mode = "function", inherits = TRUE)
-    is_admin_local <- reactive({
-      if (is.null(is_admin_fun)) return(FALSE)
-      val <- try(is_admin_fun(), silent = TRUE)
-      if (inherits(val, "try-error")) FALSE else isTRUE(val)
+    can_share_global_local <- reactive({
+      u <- tolower(trimws(as.character(session$user %||% "")))
+      nzchar(u) && grepl("jgaynor@pitchingcoachu.com", u, fixed = TRUE)
     })
     
     get_team_filtered_players <- function(report_type, team_type) {
       team_type <- team_type %||% "All"
       switch(report_type,
         "Pitching" = {
-          pool <- unique(stats::na.omit(c(pitch_data_pitching$Pitcher, pitch_data$Pitcher)))
+          pool <- if (identical(team_type, "Opponents")) {
+            unique(stats::na.omit(as.character(pitch_data$Pitcher)))
+          } else {
+            unique(stats::na.omit(as.character(pitch_data_pitching$Pitcher)))
+          }
           pool <- pool[nzchar(pool)]
           if (team_type == "Campers") {
-            sort(intersect(ALLOWED_CAMPERS, pool))
+            sort(intersect(ALLOWED_CAMPERS_DL, pool))
           } else if (team_type == TEAM_CODE) {
-            sort(intersect(ALLOWED_PITCHERS, pool))
+            sort(intersect(ALLOWED_PITCHERS_DL, pool))
+          } else if (team_type == "Opponents") {
+            known_norm <- unique(c(norm_name_ci(ALLOWED_PITCHERS_DL), norm_name_ci(ALLOWED_CAMPERS_DL)))
+            sort(unique(pool[!(norm_name_ci(pool) %in% known_norm)]))
           } else {
             sort(pool)
           }
         },
         "Hitting" = {
-          pool <- unique(stats::na.omit(c(pitch_data$Batter, pitch_data_pitching$Batter)))
+          pool <- unique(stats::na.omit(as.character(pitch_data$Batter)))
           pool <- pool[nzchar(pool)]
           if (team_type == "Campers") {
-            sort(intersect(ALLOWED_CAMPERS, pool))
+            sort(intersect(ALLOWED_CAMPERS_DL, pool))
           } else if (team_type == TEAM_CODE) {
-            sort(intersect(ALLOWED_HITTERS, pool))
+            sort(intersect(ALLOWED_HITTERS_DL, pool))
+          } else if (team_type == "Opponents") {
+            known_norm <- unique(c(norm_name_ci(ALLOWED_HITTERS_DL), norm_name_ci(ALLOWED_CAMPERS_DL)))
+            sort(unique(pool[!(norm_name_ci(pool) %in% known_norm)]))
           } else {
             sort(pool)
           }
@@ -16536,7 +17225,7 @@ custom_reports_server <- function(id) {
     }
     
     output$report_global_toggle <- renderUI({
-      if (!isTRUE(is_admin_local())) return(NULL)
+      if (!isTRUE(can_share_global_local())) return(NULL)
       checkboxInput(ns("report_global"), "Share with all schools (admin)", value = FALSE)
     })
     
@@ -16556,7 +17245,6 @@ custom_reports_server <- function(id) {
         shinyjs::removeClass(selector = paste0("#", ns("main_column")), class = "col-sm-9")
         shinyjs::addClass(selector = paste0("#", ns("main_column")), class = "col-sm-12")
       }
-      session$sendCustomMessage("creports_force_reflow", list(rootId = ns("report_canvas_wrapper")))
     })
     
     # Show sidebar button click
@@ -16567,7 +17255,6 @@ custom_reports_server <- function(id) {
       shinyjs::removeClass(selector = paste0("#", ns("main_column")), class = "col-sm-12")
       shinyjs::addClass(selector = paste0("#", ns("main_column")), class = "col-sm-9")
       updateActionButton(session, "toggle_sidebar", label = "Hide Sidebar")
-      session$sendCustomMessage("creports_force_reflow", list(rootId = ns("report_canvas_wrapper")))
     })
     
     observe({
@@ -16607,79 +17294,53 @@ custom_reports_server <- function(id) {
       cr <- custom_reports_store()
       if (!nm %in% names(cr)) return()
       rep <- cr[[nm]]
-      if (!is.list(rep)) return()
-      scalar_chr <- function(x, default = "") {
-        if (is.null(x) || length(x) < 1 || all(is.na(x))) return(default)
-        as.character(x[[1]])
+      if (!is.list(rep)) {
+        message("Skipping malformed saved report '", nm, "': expected list payload.")
+        return()
       }
-      scalar_int <- function(x, default = 1L, min_val = 1L, max_val = 15L) {
-        out <- suppressWarnings(as.integer(x[[1]]))
-        if (is.null(out) || length(out) < 1 || is.na(out)) out <- as.integer(default)
-        out <- max(as.integer(min_val), out)
-        out <- min(as.integer(max_val), out)
-        out
-      }
-      loaded_title <- scalar_chr(rep$title, "")
-      loaded_subtitle <- scalar_chr(rep$subtitle, "")
-      loaded_team <- scalar_chr(rep$team, "All")
-      loaded_type <- scalar_chr(rep$type, "Pitching")
-      if (!loaded_type %in% c("Pitching", "Hitting")) loaded_type <- "Pitching"
-      loaded_scope <- scalar_chr(rep$scope, "Single Player")
-      if (!loaded_scope %in% c("Single Player", "Multi-Player")) loaded_scope <- "Single Player"
-      loaded_players <- rep$players %||% character(0)
-      loaded_rows <- scalar_int(rep$rows, default = 1L, min_val = 1L, max_val = 15L)
-      loaded_cols <- scalar_int(rep$cols, default = 1L, min_val = 1L, max_val = 5L)
-      if (isTRUE(is_admin_local())) {
+      rep_cells <- rep$cells
+      if (!is.list(rep_cells)) rep_cells <- list()
+      if (isTRUE(can_share_global_local())) {
         updateCheckboxInput(session, "report_global", value = identical(rep$school_code, GLOBAL_SCOPE))
       }
       
       # Set loading flag to prevent observe block from overwriting
       loading_report(TRUE)
-
-      # Store the players from the saved report so get_cell_data_wrapper can use
-      # correct players during load (before input$report_players round-trip completes)
-      loading_scope_players(loaded_players)
-
-      # FIRST: Update current_cells with saved data (before UI changes)
-      loaded_cells <- rep$cells
-      if (!is.list(loaded_cells)) loaded_cells <- list()
       
-      # Update current_cells IMMEDIATELY - this is critical for render_cell() to read correct values
-      update_reports_grid(loaded_cells)
+      # FIRST: Update current_cells with saved data (before UI changes)
+      update_reports_grid(rep_cells)
+      new_report_token(as.numeric(Sys.time()))
       
       # Also populate cell_titles from the loaded report
       titles <- list()
-      for (cell_id in names(loaded_cells)) {
-        cell_obj <- loaded_cells[[cell_id]]
-        if (is.list(cell_obj) && !is.null(cell_obj$title)) {
-          titles[[cell_id]] <- cell_obj$title
+      for (cell_id in names(rep_cells)) {
+        saved_cell <- rep_cells[[cell_id]]
+        if (!is.list(saved_cell)) next
+        if (!is.null(saved_cell$title)) {
+          titles[[cell_id]] <- saved_cell$title
         }
       }
       cell_titles(titles)
       
       # THEN: Update all UI elements (this will trigger renderUI which reads from current_cells)
-      updateTextInput(session, "report_title", value = loaded_title)
-      updateTextInput(session, "report_subtitle", value = loaded_subtitle)
-      updateSelectInput(session, "report_team", selected = loaded_team)
-      updateSelectInput(session, "report_type", selected = loaded_type)
-      updateSelectInput(session, "report_scope", selected = loaded_scope)
-      updateSelectizeInput(session, "report_players", selected = loaded_players)
-      updateSelectInput(session, "report_rows", selected = loaded_rows)
-      updateSelectInput(session, "report_cols", selected = loaded_cols)
+      updateTextInput(session, "report_title", value = rep$title %||% "")
+      updateTextInput(session, "report_subtitle", value = rep$subtitle %||% "")
+      updateSelectInput(session, "report_team", selected = rep$team %||% "All")
+      updateSelectInput(session, "report_type", selected = rep$type %||% "Pitching")
+      updateSelectInput(session, "report_scope", selected = rep$scope %||% "Single Player")
+      updateSelectizeInput(session, "report_players", selected = rep$players %||% character(0))
+      updateSelectInput(session, "report_rows", selected = rep$rows %||% 1)
+      updateSelectInput(session, "report_cols", selected = rep$cols %||% 1)
       updateCheckboxInput(session, "use_global_dates", value = isTRUE(rep$use_global_dates))
       updateCheckboxInput(session, "show_pitch_type_key", value = if (is.null(rep$show_pitch_type_key)) TRUE else isTRUE(rep$show_pitch_type_key))
       if (!is.null(rep$global_dates) && length(rep$global_dates) == 2) {
         updateDateRangeInput(session, "global_dates", start = rep$global_dates[1], end = rep$global_dates[2])
       }
       
-      # FINALLY: Trigger report token update AFTER current_cells and UI updates
-      # This ensures all reactives see the new data when they invalidate
-      new_report_token(as.numeric(Sys.time()))
-      
-      rows <- loaded_rows
-      cols <- loaded_cols
-      scope <- loaded_scope
-      cells <- loaded_cells
+      rows <- rep$rows %||% 1
+      cols <- rep$cols %||% 1
+      scope <- rep$scope %||% "Single Player"
+      cells <- rep_cells
 
       update_saved_state <- function() {
         for (r in seq_len(rows)) {
@@ -16701,8 +17362,8 @@ custom_reports_server <- function(id) {
         for (r in seq_len(rows)) {
           note_val <- cells[[paste0("row_", r, "_panel_note")]] %||% ""
           span_val <- cells[[paste0("row_", r, "_panel_note_span")]] %||% 1
-          span_val <- coerce_int_scalar(span_val, default = 1L)
-          if (span_val < 1L) span_val <- 1L
+          span_val <- suppressWarnings(as.integer(span_val))
+          if (is.na(span_val) || span_val < 1) span_val <- 1
           max_span <- max(1L, rows - r + 1L)
           span_val <- min(span_val, max_span)
           updateTextInput(session, paste0("row_panel_note_", r), value = note_val)
@@ -16712,8 +17373,8 @@ custom_reports_server <- function(id) {
           for (c in seq_len(cols)) {
             cell_id <- paste0("r", r, "c", c)
             saved_cell <- cells[[cell_id]]
-            if (!is.list(saved_cell)) next
             if (is.null(saved_cell)) next
+            if (!is.list(saved_cell)) next
             if (!is.null(saved_cell$type)) {
               updateSelectInput(session, paste0("cell_type_", cell_id), selected = saved_cell$type)
             }
@@ -16737,6 +17398,9 @@ custom_reports_server <- function(id) {
             }
             if (!is.null(saved_cell$filter_select)) {
               updateSelectizeInput(session, paste0("cell_filter_select_", cell_id), selected = saved_cell$filter_select)
+            }
+            if (!is.null(saved_cell$note_text)) {
+              updateTextAreaInput(session, paste0("cell_note_", cell_id), value = saved_cell$note_text)
             }
             if (!is.null(saved_cell$span) && length(saved_cell$span) == 1 && !is.na(saved_cell$span)) {
               updateNumericInput(session, paste0("cell_span_", cell_id), value = saved_cell$span)
@@ -16801,6 +17465,7 @@ custom_reports_server <- function(id) {
           for (c in seq_len(cols)) {
             cell_id <- paste0("r", r, "c", c)
             saved_cell <- cells[[cell_id]] %||% list()
+            if (!is.list(saved_cell)) saved_cell <- list()
             show_val <- saved_cell$show_controls
             if (is.null(show_val)) show_val <- TRUE
             updateCheckboxInput(session, paste0("cell_show_controls_", cell_id), value = show_val)
@@ -16814,40 +17479,12 @@ custom_reports_server <- function(id) {
           later::cancel(loading_report_handle)
           loading_report_handle <<- NULL
         }
-        apply_loaded_state <- function(attempt = 1L) {
+        loading_report_handle <<- later::later(function() {
           if (loading_report_cycle != load_cycle) return()
           update_saved_state()
-          # Re-assert loaded report metadata after dependent observers settle.
-          updateTextInput(session, "report_title", value = loaded_title)
-          updateTextInput(session, "report_subtitle", value = loaded_subtitle)
-          updateSelectInput(session, "report_team", selected = loaded_team)
-          updateSelectInput(session, "report_type", selected = loaded_type)
-          updateSelectInput(session, "report_scope", selected = loaded_scope)
-          updateSelectizeInput(session, "report_players", selected = loaded_players)
-          updateSelectInput(session, "report_rows", selected = as.character(loaded_rows))
-          updateSelectInput(session, "report_cols", selected = as.character(loaded_cols))
-          # Re-assert the correct current_cells from the saved report to undo any
-          # premature overwrites by the throttled observe (which fires when
-          # loading_report flips to FALSE and may read stale input values).
-          update_reports_grid(loaded_cells)
-          if (attempt < 8L) {
-            loading_report_handle <<- later::later(function() {
-              apply_loaded_state(attempt + 1L)
-            }, delay = 0.15)
-            return()
-          }
-
-          loading_scope_players(loaded_players)
-          # Trigger one final repaint after all saved values are flushed.
-          # This ensures header re-renders with correct title
-          new_report_token(as.numeric(Sys.time()))
           loading_report(FALSE)
           loading_report_handle <<- NULL
-        }
-
-        loading_report_handle <<- later::later(function() {
-          apply_loaded_state(1L)
-        }, delay = 0.2)
+        }, delay = 0.5)
       }, once = TRUE)
     }, ignoreInit = TRUE)
     
@@ -16938,8 +17575,8 @@ custom_reports_server <- function(id) {
       for (r in seq_len(rows)) {
         note_val <- cells[[paste0("row_", r, "_panel_note")]] %||% ""
         span_val <- cells[[paste0("row_", r, "_panel_note_span")]] %||% 1
-        span_val <- coerce_int_scalar(span_val, default = 1L)
-        if (span_val < 1L) span_val <- 1L
+        span_val <- suppressWarnings(as.integer(span_val))
+        if (is.na(span_val) || span_val < 1) span_val <- 1
         max_span <- max(1L, rows - r + 1L)
         span_val <- min(span_val, max_span)
         updateTextInput(session, paste0("row_panel_note_", r), value = note_val)
@@ -16949,10 +17586,9 @@ custom_reports_server <- function(id) {
     
     # Header showing report title + players
     output$report_header <- renderUI({
-      token <- new_report_token()
       title_txt <- trimws(input$report_title)
       subtitle_txt <- trimws(input$report_subtitle %||% "")
-
+      
       # Helper function to format player names from "Last, First" to "First Last"
       format_player_name <- function(p) {
         if (grepl(",", p)) {
@@ -16966,7 +17602,7 @@ custom_reports_server <- function(id) {
           p
         }
       }
-
+      
       # Build player label based on mode - DON'T show player names in Multi-Player
       player_lbl <- if (input$report_scope == "Multi-Player") {
         NULL  # Don't show player names in Multi-Player mode
@@ -16980,10 +17616,9 @@ custom_reports_server <- function(id) {
           "No players selected"
         }
       }
-
+      
       tagList(
         div(
-          `data-report-token` = token,
           style = "margin-top:-88px; margin-bottom:24px;",
           h3(style = "margin-top:0; margin-bottom:2px; text-align:center; font-size:34px;",
              if (nzchar(title_txt)) title_txt else "Custom Report"),
@@ -17007,40 +17642,27 @@ custom_reports_server <- function(id) {
     }
 
     flush_row_note_now <- function(row_num, value = NULL) {
-      if (isTRUE(loading_report())) return(invisible(NULL))
       rows_now <- suppressWarnings(as.integer(input$report_rows))
       if (is.na(rows_now) || rows_now < 1 || row_num < 1 || row_num > rows_now) return(invisible(NULL))
       pending_val <- isolate(input[[paste0("row_panel_note_pending_", row_num)]])
       note_val <- if (!is.null(value)) value else if (!is.null(pending_val)) pending_val else isolate(input[[paste0("row_panel_note_", row_num)]])
       if (is.null(note_val)) return(invisible(NULL))
       cells <- isolate(current_cells())
-      key <- paste0("row_", row_num, "_panel_note")
-      if (identical(cells[[key]], note_val)) return(invisible(NULL))
-      cells[[key]] <- note_val
-      set_current_cells_if_changed(cells)
-    }
-
-    coerce_int_scalar <- function(x, default = 1L) {
-      vals <- suppressWarnings(as.integer(x))
-      vals <- vals[!is.na(vals)]
-      if (!length(vals)) return(as.integer(default))
-      as.integer(vals[[1]])
+      cells[[paste0("row_", row_num, "_panel_note")]] <- note_val
+      current_cells(cells)
     }
 
     flush_row_note_span_now <- function(row_num, value = NULL) {
-      if (isTRUE(loading_report())) return(invisible(NULL))
       rows_now <- suppressWarnings(as.integer(input$report_rows))
       if (is.na(rows_now) || rows_now < 1 || row_num < 1 || row_num > rows_now) return(invisible(NULL))
       max_span <- max(1L, rows_now - row_num + 1L)
       raw_span <- if (!is.null(value)) value else isolate(input[[paste0("row_panel_note_span_", row_num)]])
-      span_val <- coerce_int_scalar(raw_span, default = 1L)
-      if (span_val < 1L) span_val <- 1L
+      span_val <- suppressWarnings(as.integer(raw_span))
+      if (is.na(span_val) || span_val < 1) span_val <- 1L
       span_val <- min(span_val, max_span)
       cells <- isolate(current_cells())
-      key <- paste0("row_", row_num, "_panel_note_span")
-      if (identical(cells[[key]], span_val)) return(invisible(NULL))
-      cells[[key]] <- span_val
-      set_current_cells_if_changed(cells)
+      cells[[paste0("row_", row_num, "_panel_note_span")]] <- span_val
+      current_cells(cells)
     }
 
     observeEvent(input$download_report_pdf, {
@@ -17113,7 +17735,7 @@ custom_reports_server <- function(id) {
         }
       }
       
-      scope <- if (isTRUE(is_admin_local()) && isTRUE(input$report_global)) GLOBAL_SCOPE else current_school()
+      scope <- if (isTRUE(can_share_global_local()) && isTRUE(input$report_global)) GLOBAL_SCOPE else current_school()
       rep <- list(
         title = nm,
         subtitle = trimws(input$report_subtitle %||% ""),
@@ -17142,6 +17764,11 @@ custom_reports_server <- function(id) {
       if (!nzchar(nm)) return()
       cr <- custom_reports_store()
       if (nm %in% names(cr)) {
+        item_scope <- toupper(trimws(as.character(cr[[nm]]$school_code %||% current_school())))
+        if (identical(item_scope, GLOBAL_SCOPE) && !isTRUE(can_share_global_local())) {
+          showNotification("Only jgaynor@pitchingcoachu.com can delete global custom reports.", type = "error")
+          return()
+        }
         cr[[nm]] <- NULL
         custom_reports_store(cr); save_custom_reports(cr)
         updateSelectInput(session, "saved_report", choices = c("", names(cr)), selected = "")
@@ -17171,10 +17798,7 @@ custom_reports_server <- function(id) {
         flush_row_note_now(r, value = "")
         flush_row_note_span_now(r, value = 1)
       }
-      if (isTRUE(is_admin_local())) updateCheckboxInput(session, "report_global", value = FALSE)
-      
-      # Trigger token update to force header re-render
-      new_report_token(as.numeric(Sys.time()))
+      if (isTRUE(can_share_global_local())) updateCheckboxInput(session, "report_global", value = FALSE)
 
       loading_report_handle <<- later::later(function() {
         if (loading_report_cycle != new_cycle) return()
@@ -17192,20 +17816,13 @@ custom_reports_server <- function(id) {
     loading_report_cycle <- 0  # Tracks active loading cycle
     loading_report_handle <- NULL
     new_report_token <- reactiveVal(0)
-    loading_scope_players <- reactiveVal(NULL)  # Stores players from saved report during load
 
     start_loading_cycle <- function() {
       loading_report_cycle <<- loading_report_cycle + 1
       loading_report_cycle
     }
-    set_current_cells_if_changed <- function(cells_list) {
-      old_cells <- isolate(current_cells())
-      if (!identical(old_cells, cells_list)) {
-        current_cells(cells_list)
-      }
-    }
     update_reports_grid <- function(cells_list) {
-      set_current_cells_if_changed(cells_list)
+      current_cells(cells_list)
     }
     
     # Keep all per-panel date inputs synced to the global date range whenever it changes.
@@ -17233,7 +17850,6 @@ custom_reports_server <- function(id) {
 
     output$report_pitch_type_legend <- renderUI({
       if (!isTRUE(input$show_pitch_type_key)) return(NULL)
-      if (isTRUE(loading_report())) return(NULL)
       rows <- suppressWarnings(as.integer(input$report_rows))
       cols <- suppressWarnings(as.integer(input$report_cols))
       if (is.na(rows) || is.na(cols) || rows < 1 || cols < 1) return(NULL)
@@ -17369,9 +17985,7 @@ custom_reports_server <- function(id) {
           existing_zone <- input[[paste0("cell_zone_", cell_id)]] %||% saved_cell$zone %||% NULL
           out <- c(out, list(
             selectInput(ns(paste0("cell_zone_", cell_id)), "Zone Location:",
-                        choices = c("All",
-                                    "Upper Half","Bottom Half","Left Half","Right Half",
-                                    "Upper 3rd","Bottom 3rd","Left 3rd","Right 3rd"),
+                        choices = pitching_zone_location_choices,
                         selected = if (!is.null(existing_zone)) existing_zone else "All", 
                         multiple = TRUE)
           ))
@@ -17487,8 +18101,8 @@ custom_reports_server <- function(id) {
         note_span_input <- input[[paste0("row_panel_note_span_", note_row)]]
         note_span_saved <- cells[[paste0("row_", note_row, "_panel_note_span")]] %||% 1
         note_span_raw <- if (!is.null(note_span_input)) note_span_input else note_span_saved
-        note_span <- coerce_int_scalar(note_span_raw, default = 1L)
-        if (note_span < 1L) note_span <- 1L
+        note_span <- suppressWarnings(as.integer(note_span_raw))
+        if (is.na(note_span) || note_span < 1) note_span <- 1L
         max_span <- max(1L, rows - note_row + 1L)
         note_span <- min(note_span, max_span)
         row_note_starts[[note_row]] <- list(text = note_text, span = note_span)
@@ -17516,12 +18130,11 @@ custom_reports_server <- function(id) {
         # Build cells for this row
         cell_infos <- lapply(seq_len(cols), function(cn) {
           cell_id <- paste0("r", r, "c", cn)
-          sel <- cells[[cell_id]]
-          if (!is.list(sel)) sel <- list()
-          sel <- modifyList(list(
+          sel <- cells[[cell_id]] %||% list(
             type = "", 
             filter = "Pitch Types", 
             title = "",
+            note_text = "",
             show_controls = TRUE,
             table_mode = "Stuff",
             table_custom_cols = character(0),
@@ -17530,10 +18143,9 @@ custom_reports_server <- function(id) {
             velocity_chart = "Velocity Chart (Game/Inning)",
             filter_select = c("Dates","Session Type","Pitch Types"),
             span = 1
-          ), sel)
+          )
           settings_cell_id <- if (is_multi_player && r > 1) paste0("r1c", cn) else cell_id
-          settings_sel <- cells[[settings_cell_id]]
-          if (!is.list(settings_sel)) settings_sel <- sel
+          settings_sel <- cells[[settings_cell_id]] %||% sel
           cell_type_selected <- input[[paste0("cell_type_", settings_cell_id)]] %||% settings_sel$type %||% ""
           is_summary_table <- identical(cell_type_selected, "Summary Table")
           is_controlled_row <- is_multi_player && r > 1
@@ -17556,8 +18168,8 @@ custom_reports_server <- function(id) {
         row_cells <- lapply(seq_len(cols), function(cn) {
           if (col_used[cn]) return(NULL)
           info <- cell_infos[[cn]]
-          span_val <- coerce_int_scalar(info$settings_span %||% info$span %||% 1, default = 1L)
-          if (span_val < 1L) span_val <- 1L
+          span_val <- suppressWarnings(as.integer(info$settings_span %||% info$span %||% 1))
+          if (is.na(span_val) || span_val < 1) span_val <- 1
           max_span <- cols - (cn - 1)
           span_val <- min(span_val, max_span)
           col_idx <- seq.int(cn, cn + span_val - 1)
@@ -17625,9 +18237,9 @@ custom_reports_server <- function(id) {
                                  ),
                                  selectInput(ns(paste0("cell_type_", info$cell_id)), "Content:", 
                                              choices = if (identical(input$report_type, "Pitching")) {
-                                               c("", "Movement Plot", "Release Plot", "Location Plot", "Heatmap", "Velocity Chart", "Pitch Usage Pie Chart", "Pitch Usage Bar Chart", "Velocity Bar Chart", "Velocity Distribution", "Summary Table", "Spray Chart")
+                                               c("", "Movement Plot", "Release Plot", "Location Plot", "Heatmap", "Velocity Chart", "Pitch Usage Pie Chart", "Pitch Usage Bar Chart", "Velocity Bar Chart", "Velocity Distribution", "Summary Table", "Spray Chart", "Note Section")
                                              } else {
-                                               c("", "Movement Plot", "Release Plot", "Location Plot", "Heatmap", "Summary Table", "Spray Chart")
+                                               c("", "Movement Plot", "Release Plot", "Location Plot", "Heatmap", "Summary Table", "Spray Chart", "Note Section")
                                              },
                                              selected = info$sel$type),
                                  {
@@ -17662,7 +18274,7 @@ custom_reports_server <- function(id) {
                                                    if (!is.null(info$sel$table_mode) && info$sel$table_mode %in% ch) info$sel$table_mode else ch[[1]]
                                                  }),
                                      selectInput(ns(paste0("cell_filter_", info$cell_id)), "Split By:", 
-                                                 choices = c("Pitch Types","Batter Hand","Pitcher Hand","Count","After Count","Velocity","IVB","HB","Batter"),
+                                                 choices = universal_split_by_choices,
                                                  selected = info$sel$filter),
                                      checkboxInput(ns(paste0("cell_color_", info$cell_id)), "Color-Code", value = info$sel$color %||% TRUE),
                                      conditionalPanel(
@@ -17703,16 +18315,28 @@ custom_reports_server <- function(id) {
                                      selected = info$sel$velocity_chart %||% "Velocity Chart (Game/Inning)"
                                    )
                                  ),
-                                 selectizeInput(
-                                   ns(paste0("cell_filter_select_", info$cell_id)),
-                                   "Filters to show:",
-                                   choices = c("Dates","Session Type","Pitch Types","Batter Hand","Pitcher Hand","Pitch Results","QP Locations",
-                                               "Count","After Count","Zone Location","Velo Min/Max","IVB Min/Max","HB Min/Max"),
-                                   selected = info$sel$filter_select %||% c("Dates","Session Type","Pitch Types"),
-                                   multiple = TRUE,
-                                   options = list(plugins = list("remove_button"))
+                                 conditionalPanel(
+                                   sprintf("input['%s'] == 'Note Section'", ns(paste0("cell_type_", info$cell_id))),
+                                   tags$div(
+                                     style = "font-size:12px; color:#666; margin-top:4px;",
+                                     "Type your note in the box below."
+                                   )
                                  ),
-                                 uiOutput(ns(paste0("cell_filters_", info$cell_id)))
+                                 conditionalPanel(
+                                   sprintf("input['%s'] != 'Note Section'", ns(paste0("cell_type_", info$cell_id))),
+                                   tagList(
+                                     selectizeInput(
+                                       ns(paste0("cell_filter_select_", info$cell_id)),
+                                       "Filters to show:",
+                                       choices = c("Dates","Session Type","Pitch Types","Batter Hand","Pitcher Hand","Pitch Results","QP Locations",
+                                                   "Count","After Count","Zone Location","Velo Min/Max","IVB Min/Max","HB Min/Max"),
+                                       selected = info$sel$filter_select %||% c("Dates","Session Type","Pitch Types"),
+                                       multiple = TRUE,
+                                       options = list(plugins = list("remove_button"))
+                                     ),
+                                     uiOutput(ns(paste0("cell_filters_", info$cell_id)))
+                                   )
+                                 )
                                )
                              )
                            ),
@@ -17756,11 +18380,9 @@ custom_reports_server <- function(id) {
         )
       })
       
-      # Add token as attribute to force re-render when loading new reports
       div(
         class = paste("creport-grid", paste0("creport-rows-", rows)),
         style = sprintf("--creport-rows:%d; --creport-cols:%d;", rows, cols),
-        `data-report-token` = new_report_token(),
         tagList(grid)
       )
     })
@@ -17797,8 +18419,7 @@ custom_reports_server <- function(id) {
           id <- paste0("r", r, "c", c)
           
           # Get existing cell data or create new
-          existing_cell <- cells[[id]]
-          if (!is.list(existing_cell)) existing_cell <- list()
+          existing_cell <- cells[[id]] %||% list()
           
           # Helper function to update value only if input exists, otherwise keep existing
           update_if_exists <- function(input_val, existing_val, default_val = NULL) {
@@ -17812,6 +18433,7 @@ custom_reports_server <- function(id) {
             type = update_if_exists(input[[paste0("cell_type_", id)]], existing_cell$type, ""),
             filter = update_if_exists(input[[paste0("cell_filter_", id)]], existing_cell$filter, "Pitch Types"),
             title = title_vals[[id]] %||% existing_cell$title %||% "",  # Prefer latest debounced title
+            note_text = existing_cell$note_text %||% "",
             show_controls = update_if_exists(input[[paste0("cell_show_controls_", id)]], existing_cell$show_controls, TRUE),
             table_mode = update_if_exists(input[[paste0("cell_table_mode_", id)]], existing_cell$table_mode, "Stuff"),
             table_custom_cols = update_if_exists(input[[paste0("cell_table_custom_cols_", id)]], existing_cell$table_custom_cols, character(0)),
@@ -17841,7 +18463,7 @@ custom_reports_server <- function(id) {
           # Keep UI in sync with stored state
         }
       }
-      set_current_cells_if_changed(cells)
+      current_cells(cells)
     }) %>% throttle(2000)  # Throttle to 2 seconds to reduce saves during rapid changes
     
     # Separate observer to handle title updates with debounce (prevents interruption while typing)
@@ -17858,7 +18480,19 @@ custom_reports_server <- function(id) {
       existing_cell <- cells[[cell_id]] %||% list()
       existing_cell$title <- title_val
       cells[[cell_id]] <- existing_cell
-      set_current_cells_if_changed(cells)
+      current_cells(cells)
+    }
+
+    flush_cell_note_now <- function(cell_id, value = NULL) {
+      pending_val <- isolate(input[[paste0("cell_note_pending_", cell_id)]])
+      note_val <- if (!is.null(value)) value else if (!is.null(pending_val)) pending_val else isolate(input[[paste0("cell_note_", cell_id)]])
+      if (is.null(note_val)) return(invisible(NULL))
+      cells <- isolate(current_cells())
+      existing_cell <- cells[[cell_id]] %||% list()
+      if (identical(existing_cell$note_text %||% "", note_val)) return(invisible(NULL))
+      existing_cell$note_text <- note_val
+      cells[[cell_id]] <- existing_cell
+      current_cells(cells)
     }
 
     created_title_flush_ids <- character(0)
@@ -17873,11 +18507,9 @@ custom_reports_server <- function(id) {
         local({
           rid <- r
           observeEvent(input[[paste0("row_panel_note_blur_", rid)]], {
-            if (isTRUE(loading_report())) return()
             flush_row_note_now(rid, value = input[[paste0("row_panel_note_blur_", rid)]])
           }, ignoreInit = TRUE)
           observeEvent(input[[paste0("row_panel_note_span_", rid)]], {
-            if (isTRUE(loading_report())) return()
             flush_row_note_span_now(rid, value = input[[paste0("row_panel_note_span_", rid)]])
           }, ignoreInit = TRUE)
         })
@@ -17911,6 +18543,9 @@ custom_reports_server <- function(id) {
             observeEvent(input[[paste0("cell_title_blur_", id)]], {
               flush_cell_title_now(id, value = input[[paste0("cell_title_blur_", id)]])
             }, ignoreInit = TRUE)
+            observeEvent(input[[paste0("cell_note_blur_", id)]], {
+              flush_cell_note_now(id, value = input[[paste0("cell_note_blur_", id)]])
+            }, ignoreInit = TRUE)
           })
         }
       }
@@ -17919,7 +18554,6 @@ custom_reports_server <- function(id) {
 
     # Sync titles from cell_titles back to current_cells (so they're saved permanently)
     observe({
-      if (isTRUE(loading_report())) return()
       titles <- cell_titles()
       cells <- isolate(current_cells())
       
@@ -17932,7 +18566,7 @@ custom_reports_server <- function(id) {
           cells[[cell_id]] <- list(title = titles[[cell_id]])
         }
       }
-      set_current_cells_if_changed(cells)
+      current_cells(cells)
     }) %>% debounce(500)  # Reduced to 500ms for faster syncing
     
     # Helper: get filtered dataset for player(s) for a given cell
@@ -18063,30 +18697,18 @@ custom_reports_server <- function(id) {
     
     # Wrapper that extracts inputs and calls cached function
     get_cell_data_wrapper <- function(cell_id) {
-      is_loading_now <- isTRUE(loading_report())
-
       # Determine which player(s) to use
       players <- if (input$report_scope == "Multi-Player") {
         # Extract row number from cell_id (e.g., "r1c2" -> row 1)
         row_num <- as.integer(sub("r(\\d+)c.*", "\\1", cell_id))
-        row_player <- if (is_loading_now) {
-          current_cells()[[paste0("row_", row_num, "_player")]]
-        } else {
-          input[[paste0("row_player_", row_num)]] %||% current_cells()[[paste0("row_", row_num, "_player")]]
-        }
+        row_player <- input[[paste0("row_player_", row_num)]]
         if (is.null(row_player) || !nzchar(row_player)) {
           return(data.frame())  # No player selected for this row
         }
         row_player
       } else {
         # Single Player mode - use main player selector
-        # During loading, use the saved players (before input$report_players round-trip completes)
-        single_players <- if (is_loading_now) {
-          lsp <- loading_scope_players()
-          if (!is.null(lsp) && length(lsp) > 0) lsp else input$report_players
-        } else {
-          input$report_players
-        }
+        single_players <- input$report_players
         if (is.null(single_players) || length(single_players) == 0 ||
             all(trimws(single_players) == "")) {
           single_players <- "All"
@@ -18113,14 +18735,9 @@ custom_reports_server <- function(id) {
         cell_id
       }
       
-      cell_state <- current_cells()[[filter_cell_id]]
-      if (!is.list(cell_state)) cell_state <- list()
+      cell_state <- current_cells()[[filter_cell_id]] %||% list()
       use_global_dates <- isTRUE(input$use_global_dates)
       global_dates <- input$global_dates
-      pick_filter_val <- function(input_id, state_val, default_val = NULL) {
-        if (is_loading_now) return(state_val %||% default_val)
-        input[[input_id]] %||% state_val %||% default_val
-      }
 
       get_cell_data(
         cell_id = cell_id,
@@ -18129,23 +18746,23 @@ custom_reports_server <- function(id) {
         dates = if (use_global_dates && !is.null(global_dates) && length(global_dates) == 2) {
           global_dates
         } else {
-          pick_filter_val(paste0("cell_dates_", filter_cell_id), cell_state$dates)
+          input[[paste0("cell_dates_", filter_cell_id)]] %||% cell_state$dates
         },
-        session = pick_filter_val(paste0("cell_session_", filter_cell_id), cell_state$session, "All"),
-        pitch_types = pick_filter_val(paste0("cell_pitch_types_", filter_cell_id), cell_state$pitch_types),
-        batter_side = pick_filter_val(paste0("cell_batter_side_", filter_cell_id), cell_state$batter_side),
-        pitcher_hand = pick_filter_val(paste0("cell_pitcher_hand_", filter_cell_id), cell_state$pitcher_hand),
-        results = pick_filter_val(paste0("cell_results_", filter_cell_id), cell_state$results),
-        qp = pick_filter_val(paste0("cell_qp_", filter_cell_id), cell_state$qp),
-        count = pick_filter_val(paste0("cell_count_", filter_cell_id), cell_state$count),
-        after_count = pick_filter_val(paste0("cell_after_count_", filter_cell_id), cell_state$after_count),
-        zone = pick_filter_val(paste0("cell_zone_", filter_cell_id), cell_state$zone),
-        velo_min = pick_filter_val(paste0("cell_velo_min_", filter_cell_id), cell_state$velo_min),
-        velo_max = pick_filter_val(paste0("cell_velo_max_", filter_cell_id), cell_state$velo_max),
-        ivb_min = pick_filter_val(paste0("cell_ivb_min_", filter_cell_id), cell_state$ivb_min),
-        ivb_max = pick_filter_val(paste0("cell_ivb_max_", filter_cell_id), cell_state$ivb_max),
-        hb_min = pick_filter_val(paste0("cell_hb_min_", filter_cell_id), cell_state$hb_min),
-        hb_max = pick_filter_val(paste0("cell_hb_max_", filter_cell_id), cell_state$hb_max)
+        session = input[[paste0("cell_session_", filter_cell_id)]] %||% cell_state$session %||% "All",
+        pitch_types = input[[paste0("cell_pitch_types_", filter_cell_id)]] %||% cell_state$pitch_types,
+        batter_side = input[[paste0("cell_batter_side_", filter_cell_id)]] %||% cell_state$batter_side,
+        pitcher_hand = input[[paste0("cell_pitcher_hand_", filter_cell_id)]] %||% cell_state$pitcher_hand,
+        results = input[[paste0("cell_results_", filter_cell_id)]] %||% cell_state$results,
+        qp = input[[paste0("cell_qp_", filter_cell_id)]] %||% cell_state$qp,
+        count = input[[paste0("cell_count_", filter_cell_id)]] %||% cell_state$count,
+        after_count = input[[paste0("cell_after_count_", filter_cell_id)]] %||% cell_state$after_count,
+        zone = input[[paste0("cell_zone_", filter_cell_id)]] %||% cell_state$zone,
+        velo_min = input[[paste0("cell_velo_min_", filter_cell_id)]] %||% cell_state$velo_min,
+        velo_max = input[[paste0("cell_velo_max_", filter_cell_id)]] %||% cell_state$velo_max,
+        ivb_min = input[[paste0("cell_ivb_min_", filter_cell_id)]] %||% cell_state$ivb_min,
+        ivb_max = input[[paste0("cell_ivb_max_", filter_cell_id)]] %||% cell_state$ivb_max,
+        hb_min = input[[paste0("cell_hb_min_", filter_cell_id)]] %||% cell_state$hb_min,
+        hb_max = input[[paste0("cell_hb_max_", filter_cell_id)]] %||% cell_state$hb_max
       )
     }
     
@@ -18164,23 +18781,9 @@ custom_reports_server <- function(id) {
         # Use this cell's own settings
         cell_id
       }
-
-      settings_state <- current_cells()[[settings_cell_id]]
-      if (!is.list(settings_state)) settings_state <- list()
-
-      # Always prefer current_cells() state over input values to ensure proper loading
-      # When loading_report() is TRUE, ONLY use current_cells()
-      # When FALSE, use input values but fall back to current_cells() if input is missing
-      tsel <- if (isTRUE(loading_report())) {
-        settings_state$type %||% ""
-      } else {
-        input[[paste0("cell_type_", settings_cell_id)]] %||% settings_state$type %||% ""
-      }
-      fsel <- if (isTRUE(loading_report())) {
-        settings_state$filter %||% "Pitch Types"
-      } else {
-        input[[paste0("cell_filter_", settings_cell_id)]] %||% settings_state$filter %||% "Pitch Types"
-      }
+      
+      tsel <- input[[paste0("cell_type_", settings_cell_id)]] %||% ""
+      fsel <- input[[paste0("cell_filter_", settings_cell_id)]] %||% "Pitch Types"
       out_id <- paste0("cell_render_", cell_id)
       tooltip_css_local <- if (exists("tooltip_css", inherits = TRUE)) tooltip_css else
         "color:#fff !important;font-weight:600;padding:6px;border-radius:8px;text-shadow:0 1px 1px rgba(0,0,0,.4);"
@@ -18195,17 +18798,50 @@ custom_reports_server <- function(id) {
         if (is.null(dm) && !is.null(input$dark_mode)) dm <- input$dark_mode
         isTRUE(dm)
       }
-      
-      # Determine if the chart type uses ggiraph (which needs special handling)
-      is_ggiraph_chart <- tsel %in% c("Movement Plot", "Release Plot", "Location Plot", "Heatmap", 
-                                       "Velocity Chart", "Pitch Usage Pie Chart", "Velocity Bar Chart",
-                                       "Velocity Distribution", "Spray Chart")
-      
-      # Note: We don't clear outputs here because it's called on every render.
-      # Shiny will automatically replace outputs when we assign new renderXXX functions.
-      
+      # clear previous output so switching types always re-renders
+      output[[out_id]] <- renderUI({ NULL })
       if (!nzchar(tsel)) {
-        output[[out_id]] <- renderUI({ div(style = "padding: 20px; text-align: center; color: #999;", "Select a chart type") })
+        output[[out_id]] <- renderUI({ NULL })
+        return(NULL)
+      }
+      if (tsel == "Note Section") {
+        output[[out_id]] <- renderUI({
+          cell_state <- current_cells()[[cell_id]] %||% list()
+          note_val <- cell_state$note_text %||% ""
+          tagList(
+            textAreaInput(
+              ns(paste0("cell_note_", cell_id)),
+              label = NULL,
+              value = note_val,
+              width = "100%",
+              height = "260px",
+              placeholder = "Type notes here..."
+            ),
+            tags$script(HTML(sprintf("
+              (function() {
+                var id = '%s';
+                var blurId = '%s';
+                var pendingId = '%s';
+                var el = document.getElementById(id);
+                if (!el) return;
+                el.removeEventListener('blur', el.__cell_note_blur_listener__);
+                el.removeEventListener('input', el.__cell_note_input_listener__);
+                var blurListener = function() {
+                  Shiny.setInputValue(blurId, el.value, {priority: 'event'});
+                };
+                var inputListener = function() {
+                  Shiny.setInputValue(pendingId, el.value, {priority: 'event'});
+                };
+                el.__cell_note_blur_listener__ = blurListener;
+                el.__cell_note_input_listener__ = inputListener;
+                el.addEventListener('blur', blurListener);
+                el.addEventListener('input', inputListener);
+                inputListener();
+              })();
+            ", ns(paste0("cell_note_", cell_id)), ns(paste0("cell_note_blur_", cell_id)),
+            ns(paste0("cell_note_pending_", cell_id)))))
+          )
+        })
         return(uiOutput(ns(out_id)))
       }
       df <- get_cell_data_wrapper(cell_id)
@@ -18506,7 +19142,7 @@ custom_reports_server <- function(id) {
             types_chr <- as.character(intersect(names(cols), unique(df_loc$SplitColumn)))
             home <- data.frame(x = c(-0.75, 0.75, 0.75, 0.00, -0.75),
                                y = c(1.05, 1.05, 1.15, 1.25, 1.15) - 0.5)
-            cz <- data.frame(xmin = -1.5, xmax = 1.5, ymin = 2.65 - 1.5, ymax = 2.65 + 1.5)
+            cz <- data.frame(xmin = -1.5, xmax = 1.5, ymin = ((ZONE_BOTTOM + ZONE_TOP) / 2) - 1.5, ymax = ((ZONE_BOTTOM + ZONE_TOP) / 2) + 1.5)
             sz <- data.frame(xmin = ZONE_LEFT, xmax = ZONE_RIGHT, ymin = ZONE_BOTTOM, ymax = ZONE_TOP)
             p <- ggplot() +
               geom_polygon(data = home, aes(x, y), fill = NA, color = line_col, inherit.aes = FALSE) +
@@ -18514,6 +19150,7 @@ custom_reports_server <- function(id) {
                         fill = NA, color = line_col, linetype = "dashed", inherit.aes = FALSE) +
               geom_rect(data = sz, aes(xmin = xmin, xmax = xmax, ymin = ymin, ymax = ymax),
                         fill = NA, color = line_col, inherit.aes = FALSE) +
+              zone_nine_square_layers(color = line_col) +
               ggiraph::geom_point_interactive(
                 data = df_other,
                 aes(PlateLocSide, PlateLocHeight,
@@ -18552,56 +19189,152 @@ custom_reports_server <- function(id) {
         })
         return(ggiraph::girafeOutput(ns(out_id), height = "280px"))
       } else if (tsel == "Heatmap") {
-        output[[out_id]] <- ggiraph::renderGirafe({
-          tryCatch({
-            df_loc <- df
-            if (!nrow(df_loc)) {
-              return(girafe_transparent(ggobj = ggplot() + theme_void()))
+        output[[out_id]] <- renderPlot({
+          df_loc <- df
+          if (!nrow(df_loc)) {
+            plot.new(); title("No data"); return(invisible())
+          }
+          
+          # Apply Pitch Results filter for heatmap too (use settings_cell_id for filter)
+          df_loc <- apply_pitch_results_filter(df_loc, input[[paste0("cell_results_", settings_cell_id)]])
+          
+          if (!nrow(df_loc)) {
+            plot.new(); title("No data after filters"); return(invisible())
+          }
+          
+          # Heatmap type selection
+          hm_stat <- input[[paste0("cell_heat_stat_", settings_cell_id)]] %||% "Frequency"
+          plot_obj <- render_heatmap_stat(
+            df_loc, hm_stat,
+            plot_xlim = c(-2.0, 2.0),
+            plot_ylim = c(0.6, 4.2)
+          )
+          print(plot_obj)
+          return(invisible())
+          
+          # Use advanced Pitching Suite heatmap implementation
+          if (hm_stat == "Frequency") {
+            grid <- make_kde_grid(df_loc$PlateLocSide, df_loc$PlateLocHeight, n = 200)
+            
+            if (!nrow(grid)) return(ggplot() + theme_void())
+            
+            # Normalize KDE values to 0-100 scale
+            grid$z <- (grid$z / max(grid$z, na.rm = TRUE)) * 100
+            
+            return(draw_heat(grid, bins = HEAT_BINS, pal_fun = heat_pal_bwr, mark_max = FALSE,
+                             show_scale = TRUE, scale_label = "Pitch Frequency",
+                             scale_limits = c(0, 80)))
+          }
+          
+          # Filter to valid location data for non-Frequency stats
+          df_loc <- df_loc %>% dplyr::filter(is.finite(PlateLocSide), is.finite(PlateLocHeight))
+          if (!nrow(df_loc)) {
+            plot.new(); title("No location data"); return(invisible())
+          }
+          
+          if (hm_stat == "Whiff Rate") {
+            swing_events <- c("StrikeSwinging", "FoulBall", "FoulBallFieldable", 
+                              "FoulBallNotFieldable", "InPlay")
+            swing_mask  <- df_loc$PitchCall %in% swing_events
+            val <- ifelse(swing_mask, ifelse(df_loc$PitchCall == "StrikeSwinging", 1, 0), NA_real_)
+            grid <- make_kde_mean_grid(df_loc$PlateLocSide, df_loc$PlateLocHeight, val)
+            if (!nrow(grid)) return(ggplot() + theme_void())
+            breaks <- c(seq(0, 50, length.out = HEAT_BINS + 1), Inf)
+            
+            return(draw_heat(grid, bins = HEAT_BINS, pal_fun = heat_pal_bwr_no_white, 
+                             breaks = breaks, mark_max = FALSE,
+                             show_scale = TRUE, scale_label = "Whiff Rate %",
+                             scale_limits = c(0, 50)))
+          }
+          
+          if (hm_stat == "GB Rate") {
+            df_bip <- df_loc %>%
+              filter(SessionType == "Live", 
+                     PitchCall == "InPlay",
+                     !is.na(TaggedHitType))
+            
+            if (nrow(df_bip) < 3) {
+              plot.new(); title("Insufficient Live BIP data"); return(invisible())
             }
-
-            # Apply Pitch Results filter for heatmap too (use settings cell state while loading)
-            results_filter <- if (isTRUE(loading_report())) {
-              settings_state$results %||% NULL
-            } else {
-              input[[paste0("cell_results_", settings_cell_id)]] %||% (settings_state$results %||% NULL)
-            }
-            df_loc <- apply_pitch_results_filter(df_loc, results_filter)
-
-            if (!nrow(df_loc)) {
-              return(girafe_transparent(ggobj = ggplot() + theme_void()))
-            }
-
-            # Heatmap type selection
-            hm_stat <- if (isTRUE(loading_report())) {
-              settings_state$heat_stat %||% "Frequency"
-            } else {
-              input[[paste0("cell_heat_stat_", settings_cell_id)]] %||% (settings_state$heat_stat %||% "Frequency")
-            }
-            plot_obj <- render_heatmap_stat(
-              df_loc, hm_stat,
-              plot_xlim = c(-2.0, 2.0),
-              plot_ylim = c(0.6, 4.2)
+            
+            val <- ifelse(df_bip$TaggedHitType == "GroundBall", 1, 0)
+            grid <- make_kde_mean_grid(df_bip$PlateLocSide, df_bip$PlateLocHeight, val)
+            if (!nrow(grid)) return(ggplot() + theme_void())
+            
+            breaks <- c(-Inf, seq(0, 70, length.out = HEAT_BINS + 1), Inf)
+            
+            return(draw_heat(grid, bins = HEAT_BINS, pal_fun = heat_pal_bwr_no_white, 
+                             breaks = breaks, mark_max = FALSE,
+                             show_scale = TRUE, scale_label = "GB Rate %",
+                             scale_limits = c(0, 70)))
+          }
+          
+          if (hm_stat == "Contact Rate") {
+            # Contact Rate = 100% - Whiff Rate (guaranteed perfect opposite colors)
+            swing_events <- c("StrikeSwinging", "FoulBall", "FoulBallFieldable", 
+                              "FoulBallNotFieldable", "InPlay")
+            swing_mask  <- df_loc$PitchCall %in% swing_events
+            val <- ifelse(swing_mask, ifelse(df_loc$PitchCall == "StrikeSwinging", 0, 1), NA_real_)
+            grid <- make_kde_mean_grid(df_loc$PlateLocSide, df_loc$PlateLocHeight, val)
+            if (!nrow(grid)) return(ggplot() + theme_void())
+            grid$z <- pmin(pmax(grid$z * 100, 50), 100)
+            breaks <- seq(50, 100, length.out = HEAT_BINS + 1)
+            
+            return(draw_heat(grid, bins = HEAT_BINS, pal_fun = heat_pal_bwr_no_white, 
+                             breaks = breaks, mark_max = FALSE,
+                             show_scale = TRUE, scale_label = "Contact Rate %",
+                             scale_limits = c(50, 100)))
+          }
+          
+          if (hm_stat == "Swing Rate") {
+            swing_events <- c("StrikeSwinging", "FoulBall", "FoulBallFieldable", 
+                              "FoulBallNotFieldable", "InPlay")
+            
+            val <- ifelse(df_loc$PitchCall %in% swing_events, 1, 0)
+            grid <- make_kde_mean_grid(df_loc$PlateLocSide, df_loc$PlateLocHeight, val)
+            if (!nrow(grid)) return(ggplot() + theme_void())
+            breaks <- seq(20, 80, length.out = HEAT_BINS + 1)
+            
+            return(draw_heat(grid, bins = HEAT_BINS, pal_fun = heat_pal_bwr_no_white, 
+                             breaks = breaks, mark_max = FALSE,
+                             show_scale = TRUE, scale_label = "Swing Rate %",
+                             scale_limits = c(20, 80)))
+          }
+          
+          if (hm_stat == "Exit Velocity") {
+            df_bip <- dplyr::filter(
+              df_loc, 
+              SessionType == "Live",
+              PitchCall == "InPlay",
+              is.finite(PlateLocSide), 
+              is.finite(PlateLocHeight),
+              is.finite(ExitSpeed)
             )
-            girafe_transparent(ggobj = plot_obj)
-          }, error = function(e) {
-            girafe_transparent(ggobj = ggplot() +
-              annotate("text", x = 0, y = 0, label = "Heatmap render error", size = 4) +
-              theme_void())
-          })
-        })
-        return(ggiraph::girafeOutput(ns(out_id), height = "280px"))
+            
+            if (!nrow(df_bip)) return(ggplot() + theme_void())
+            
+            grid <- make_kde_mean_grid(df_bip$PlateLocSide, df_bip$PlateLocHeight, df_bip$ExitSpeed)
+            if (!nrow(grid)) return(ggplot() + theme_void())
+            breaks <- seq(60, 110, length.out = HEAT_BINS + 1)
+            
+            return(draw_heat(grid, bins = HEAT_BINS, pal_fun = heat_pal_bwr_no_white, 
+                             breaks = breaks, mark_max = FALSE,
+                             show_scale = TRUE, scale_label = "Exit Velocity (mph)",
+                             scale_limits = c(60, 110)))
+          }
+          
+          # Default fallback
+          ggplot() + theme_void()
+        }, bg = "transparent")
+        return(plotOutput(ns(out_id), height = "280px"))
       } else if (tsel == "Velocity Chart") {
         output[[out_id]] <- ggiraph::renderGirafe({
           if (!identical(input$report_type, "Pitching")) return(NULL)
           df_vel <- df %>% dplyr::filter(!is.na(RelSpeed), !is.na(TaggedPitchType))
           if (!nrow(df_vel)) return(NULL)
 
-          velocity_choice <- if (isTRUE(loading_report())) {
-            settings_state$velocity_chart %||% "Velocity Chart (Game/Inning)"
-          } else {
-            input[[paste0("cell_velocity_chart_", settings_cell_id)]] %||%
-              (settings_state$velocity_chart %||% "Velocity Chart (Game/Inning)")
-          }
+          velocity_choice <- input[[paste0("cell_velocity_chart_", settings_cell_id)]] %||%
+            (current_cells()[[settings_cell_id]]$velocity_chart %||% "Velocity Chart (Game/Inning)")
 
           dark_on <- is_dark_mode_local()
           axis_col <- if (dark_on) "#e5e7eb" else "black"
@@ -19287,11 +20020,14 @@ custom_reports_server <- function(id) {
               "Pitcher Hand" = "Pitcher Hand",
               "Count" = "Count",
               "After Count" = "After Count",
+              "Zone Location" = "Zone Location",
+              "Times Through Order" = "Times Through Order",
               "Velocity" = "Velocity",
               "IVB" = "IVB",
               "HB" = "HB",
               "Batter" = if (identical(input$report_type, "Hitting")) "Pitcher" else "Batter",
               "Pitcher" = "Pitcher",
+              "Catcher" = "Catcher",
               "Pitch"
             )
             # Normalize returned DT payload so split-by column always exists with the
@@ -19398,9 +20134,19 @@ custom_reports_server <- function(id) {
           st <- tolower(trimws(as.character(df_spray$SessionType)))
           live_mask <- grepl("live|game|ab", st)
           
-          # Require in-play with numeric distance/direction
-          dist_num <- suppressWarnings(as.numeric(df_spray$Distance))
-          dir_num  <- suppressWarnings(as.numeric(df_spray$Direction))
+          # Require in-play with numeric distance/direction (fallback to legacy fields when needed)
+          dist_src <- if ("Distance" %in% names(df_spray)) df_spray$Distance else rep(NA, nrow(df_spray))
+          if ("LastTrackedDistance" %in% names(df_spray)) {
+            use_last <- !is.finite(suppressWarnings(as.numeric(dist_src)))
+            dist_src[use_last] <- df_spray$LastTrackedDistance[use_last]
+          }
+          dir_src <- if ("Direction" %in% names(df_spray)) df_spray$Direction else rep(NA, nrow(df_spray))
+          if ("Bearing" %in% names(df_spray)) {
+            use_bearing <- !is.finite(suppressWarnings(as.numeric(dir_src)))
+            dir_src[use_bearing] <- df_spray$Bearing[use_bearing]
+          }
+          dist_num <- suppressWarnings(as.numeric(dist_src))
+          dir_num  <- suppressWarnings(as.numeric(dir_src))
           ok <- which(live_mask & df_spray$PitchCall == "InPlay" &
                         is.finite(dist_num) & is.finite(dir_num))
           
@@ -19554,10 +20300,6 @@ custom_reports_server <- function(id) {
               
               # Use reactive to cache expensive computations
               cell_data <- reactive({
-                # Force invalidation when a saved/new report is loaded.
-                new_report_token()
-                is_loading_now <- isTRUE(loading_report())
-
                 # Only re-compute when these specific inputs change
                 # NOTE: Do NOT include cell_title here - it causes re-render on every keystroke
                 
@@ -19572,15 +20314,7 @@ custom_reports_server <- function(id) {
                 } else {
                   id
                 }
-                cells_snapshot <- current_cells()
-                settings_state <- cells_snapshot[[settings_id]]
-                if (!is.list(settings_state)) settings_state <- list()
-
-                pick_setting <- function(input_id, state_val, default_val = NULL) {
-                  if (is_loading_now) return(state_val %||% default_val)
-                  input[[input_id]] %||% state_val %||% default_val
-                }
-
+                
                 # Monitor these inputs to trigger re-rendering
                 input[[paste0("cell_type_", settings_id)]]
                 input[[paste0("cell_filter_", settings_id)]]
@@ -19615,19 +20349,15 @@ custom_reports_server <- function(id) {
                   input[[paste0("row_player_", row_num)]]
                 }
                 
-                # Return the actual values.
-                # Including .report_token ensures this list is never identical() between
-                # report loads, so cell_output_* always re-renders even when chart
-                # type/settings happen to be the same across two different saved reports.
+                # Return the actual values
                 list(
-                  .report_token = new_report_token(),
-                  type = pick_setting(paste0("cell_type_", settings_id), settings_state$type, ""),
-                  filter = pick_setting(paste0("cell_filter_", settings_id), settings_state$filter, "Pitch Types"),
-                  mode = pick_setting(paste0("cell_table_mode_", settings_id), settings_state$table_mode),
-                  color = pick_setting(paste0("cell_color_", settings_id), settings_state$color, TRUE),
-                  heat_stat = pick_setting(paste0("cell_heat_stat_", settings_id), settings_state$heat_stat, "Frequency"),
-                  velocity_chart = pick_setting(paste0("cell_velocity_chart_", settings_id), settings_state$velocity_chart, "Velocity Chart (Game/Inning)"),
-                  custom_cols = pick_setting(paste0("cell_table_custom_cols_", settings_id), settings_state$table_custom_cols, character(0))
+                  type = input[[paste0("cell_type_", settings_id)]],
+                  filter = input[[paste0("cell_filter_", settings_id)]],
+                  mode = input[[paste0("cell_table_mode_", settings_id)]],
+                  color = input[[paste0("cell_color_", settings_id)]],
+                  heat_stat = input[[paste0("cell_heat_stat_", settings_id)]],
+                  velocity_chart = input[[paste0("cell_velocity_chart_", settings_id)]],
+                  custom_cols = input[[paste0("cell_table_custom_cols_", settings_id)]]
                 )
               })
               
@@ -19672,44 +20402,27 @@ custom_reports_server <- function(id) {
                 # Get cell data (triggers on chart type/filter/mode changes only)
                 cd <- cell_data()
                 out_id <- paste0("cell_render_", id)
-                
-                # Get data for this cell
-                df_now <- tryCatch(
-                  get_cell_data_wrapper(id),
-                  error = function(e) {
-                    output[[out_id]] <- renderUI({
-                      div(style = "padding: 20px; text-align: center; color: #b91c1c;",
-                          paste("Chart data error:", e$message))
-                    })
-                    return(data.frame())
-                  }
-                )
-                
-                # If no data, show message
-                if (!nrow(df_now)) {
-                  return(div(
-                    style = "padding: 20px; text-align: center; color: #999;",
-                    "No data for selected filters"
-                  ))
+                if (identical(cd$type, "Note Section")) {
+                  render_cell(id)
+                  return(uiOutput(ns(out_id)))
                 }
-
+                df_now <- get_cell_data_wrapper(id)
+                if (!nrow(df_now)) {
+                  output[[out_id]] <- renderUI({
+                    div("No data for selected filters")
+                  })
+                  return(uiOutput(ns(out_id)))
+                }
+                
                 # Render the chart (title is separate, updated via shinyjs)
-                # Wrap in div with unique token to force Shiny to recognize updates
-                div(`data-report-token` = cd$.report_token, render_cell(id))
+                render_cell(id)
               })
-              outputOptions(output, paste0("cell_output_", id), suspendWhenHidden = FALSE)
             })
             existing_render <- c(existing_render, cell_id)
           }
         }
       }
       cells_with_render_observers(existing_render)
-    }, ignoreInit = FALSE)
-
-    observeEvent(list(input$report_rows, input$report_cols, new_report_token()), {
-      session$onFlushed(function() {
-        session$sendCustomMessage("creports_force_reflow", list(rootId = ns("report_canvas_wrapper")))
-      }, once = TRUE)
     }, ignoreInit = FALSE)
   })
 }
@@ -19770,7 +20483,7 @@ player_plans_ui <- function() {
           
           selectInput("pp_session_type", "Session Type:",
                       choices = session_type_choices(),
-                      selected = "Season"),
+                      selected = "All"),
           
           dateRangeInput("pp_date_range", "Date Range:",
                          start = Sys.Date() - 30,
@@ -20311,7 +21024,7 @@ init_biomech_db <- function() {
     if (backend$type == "sqlite") {
       # SQLite syntax
       message("Creating SQLite table...")
-      DBI::dbExecute(con, "
+      db_execute_safe(con, "
         CREATE TABLE IF NOT EXISTS newtforce_data (
           id INTEGER PRIMARY KEY AUTOINCREMENT,
           app_id TEXT NOT NULL,
@@ -20341,13 +21054,13 @@ init_biomech_db <- function() {
       ")
       
       message("Creating SQLite index...")
-      DBI::dbExecute(con, "
+      db_execute_safe(con, "
         CREATE INDEX IF NOT EXISTS idx_newtforce_app_id ON newtforce_data(app_id)
       ")
     } else {
       # PostgreSQL syntax
       message("Creating PostgreSQL table...")
-      DBI::dbExecute(con, "
+      db_execute_safe(con, "
         CREATE TABLE IF NOT EXISTS newtforce_data (
           id SERIAL PRIMARY KEY,
           app_id TEXT NOT NULL,
@@ -20377,7 +21090,7 @@ init_biomech_db <- function() {
       ")
       
       message("Creating PostgreSQL index...")
-      DBI::dbExecute(con, "
+      db_execute_safe(con, "
         CREATE INDEX IF NOT EXISTS idx_newtforce_app_id ON newtforce_data(app_id)
       ")
     }
@@ -20503,17 +21216,14 @@ load_newtforce_data <- function(app_id) {
   con <- biomech_db_connect()
   if (is.null(con)) return(NULL)
   
-  backend <- get_biomech_backend()
-  
   tryCatch({
-    # Use appropriate parameterized query syntax
-    if (backend$type == "sqlite") {
-      query <- "SELECT * FROM newtforce_data WHERE app_id = ? ORDER BY date DESC, last_name, first_name"
-      result <- DBI::dbGetQuery(con, query, params = list(app_id))
-    } else {
-      query <- "SELECT * FROM newtforce_data WHERE app_id = $1 ORDER BY date DESC, last_name, first_name"
-      result <- DBI::dbGetQuery(con, query, params = list(app_id))
-    }
+    app_id_sql <- as.character(DBI::dbQuoteLiteral(con, app_id))
+    query <- paste0(
+      "SELECT * FROM newtforce_data WHERE app_id = ",
+      app_id_sql,
+      " ORDER BY date DESC, last_name, first_name"
+    )
+    result <- db_get_query_safe(con, query)
     DBI::dbDisconnect(con)
     
     if (nrow(result) == 0) return(NULL)
@@ -20563,17 +21273,14 @@ get_newtforce_pitchers <- function(app_id) {
   con <- biomech_db_connect()
   if (is.null(con)) return(character(0))
   
-  backend <- get_biomech_backend()
-  
   tryCatch({
-    # Use appropriate parameterized query syntax
-    if (backend$type == "sqlite") {
-      query <- "SELECT DISTINCT first_name, last_name FROM newtforce_data WHERE app_id = ? ORDER BY last_name, first_name"
-      result <- DBI::dbGetQuery(con, query, params = list(app_id))
-    } else {
-      query <- "SELECT DISTINCT first_name, last_name FROM newtforce_data WHERE app_id = $1 ORDER BY last_name, first_name"
-      result <- DBI::dbGetQuery(con, query, params = list(app_id))
-    }
+    app_id_sql <- as.character(DBI::dbQuoteLiteral(con, app_id))
+    query <- paste0(
+      "SELECT DISTINCT first_name, last_name FROM newtforce_data WHERE app_id = ",
+      app_id_sql,
+      " ORDER BY last_name, first_name"
+    )
+    result <- db_get_query_safe(con, query)
     DBI::dbDisconnect(con)
     
     if (nrow(result) == 0) return(character(0))
@@ -20836,6 +21543,22 @@ biomech_server <- function(input, output, session, app_id_fn) {
     if (!is.null(app_id) && nzchar(app_id)) {
       data <- load_newtforce_data(app_id)
       newtforce_data(data)
+      if (!is.null(data) && nrow(data) && "Date" %in% names(data)) {
+        parsed_dates <- suppressWarnings(as.Date(as.character(data$Date), format = "%m/%d/%Y"))
+        missing_dates <- is.na(parsed_dates)
+        if (any(missing_dates)) {
+          parsed_dates[missing_dates] <- suppressWarnings(as.Date(as.character(data$Date[missing_dates])))
+        }
+        parsed_dates <- parsed_dates[is.finite(as.numeric(parsed_dates))]
+        if (length(parsed_dates)) {
+          updateDateRangeInput(
+            session,
+            "newtforce_date_range",
+            start = min(parsed_dates, na.rm = TRUE),
+            end = max(parsed_dates, na.rm = TRUE)
+          )
+        }
+      }
     }
   })
   
@@ -20939,12 +21662,25 @@ biomech_server <- function(input, output, session, app_id_fn) {
       }
     }
     
-    # Filter by date range
+    # Filter by date range (accept both mm/dd/YYYY and yyyy-mm-dd data values).
+    range_vals <- input$newtforce_date_range
+    range_start <- as.Date(NA)
+    range_end <- as.Date(NA)
+    if (!is.null(range_vals) && length(range_vals) >= 2) {
+      if (!is.null(range_vals[[1]]) && nzchar(as.character(range_vals[[1]]))) {
+        range_start <- suppressWarnings(as.Date(as.character(range_vals[[1]])))
+      }
+      if (!is.null(range_vals[[2]]) && nzchar(as.character(range_vals[[2]]))) {
+        range_end <- suppressWarnings(as.Date(as.character(range_vals[[2]])))
+      }
+    }
     data <- data %>%
-      mutate(date_obj = as.Date(Date, format = "%m/%d/%Y")) %>%
-      filter(date_obj >= input$newtforce_date_range[1],
-             date_obj <= input$newtforce_date_range[2]) %>%
-      dplyr::select(-date_obj)
+      mutate(date_obj = parse_date_flex(Date))
+    if (is.finite(as.numeric(range_start)) && is.finite(as.numeric(range_end))) {
+      data <- data %>%
+        filter(date_obj >= range_start, date_obj <= range_end)
+    }
+    data <- data %>% dplyr::select(-date_obj)
     
     # Filter by pitch type
     if (input$newtforce_pitch_type != "All") {
@@ -21286,6 +22022,7 @@ workload_panel_ui <- function() {
 }
 
 workload_data_dir <- function() file.path("data")
+log_startup_timing("Defined custom-report and workload helper functions")
 
 ensure_workload_data_dir <- function() {
   dir.create(workload_data_dir(), showWarnings = FALSE, recursive = TRUE)
@@ -21330,6 +22067,241 @@ save_workload_manual_entries <- function(entries) {
   readr::write_csv(entries, workload_manual_entries_path())
 }
 
+manual_velocity_entries_path <- function() file.path(workload_data_dir(), "manual_velocity_entries.csv")
+
+get_manual_velocity_db_config <- function() {
+  candidates <- c(
+    Sys.getenv("MANUAL_VELO_DB_URL", ""),
+    Sys.getenv("NEON_DATABASE_URL", ""),
+    Sys.getenv("DATABASE_URL", ""),
+    Sys.getenv("BIOMECH_DB_URL", ""),
+    Sys.getenv("PITCH_MOD_DB_URL", "")
+  )
+  candidates <- candidates[nzchar(candidates)]
+  for (url in candidates) {
+    parsed <- parse_pitch_mod_postgres_uri(url)
+    if (!is.null(parsed)) return(parsed)
+  }
+  # Fall back to shared YAML config used by other Postgres/Neon backends.
+  config_path <- Sys.getenv("PITCH_MOD_DB_CONFIG", "auth_db_config.yml")
+  cfg <- read_pitch_mod_db_config(config_path)
+  if (is.null(cfg)) return(NULL)
+  driver <- tolower(cfg$driver %||% "")
+  if (!driver %in% c("postgres", "postgresql", "neon")) return(NULL)
+  port_val <- suppressWarnings(as.integer(cfg$port %||% "5432"))
+  if (is.na(port_val) || port_val <= 0) port_val <- 5432
+  list(
+    host = cfg$host %||% "",
+    port = port_val,
+    user = cfg$user %||% "",
+    password = cfg$password %||% "",
+    dbname = cfg$dbname %||% "",
+    sslmode = cfg$sslmode %||% "require",
+    channel_binding = cfg$channel_binding %||% "require"
+  )
+}
+
+manual_velocity_backend <- function() {
+  cfg <- get_manual_velocity_db_config()
+  if (!is.null(cfg) && nzchar(cfg$host %||% "") && nzchar(cfg$dbname %||% "") &&
+      nzchar(cfg$user %||% "") && nzchar(cfg$password %||% "")) {
+    return(list(type = "postgres", config = cfg))
+  }
+  list(type = "csv")
+}
+
+manual_velocity_db_connect <- function() {
+  backend <- manual_velocity_backend()
+  if (!identical(backend$type, "postgres")) return(NULL)
+  if (!requireNamespace("RPostgres", quietly = TRUE)) return(NULL)
+  cfg <- backend$config
+  params <- list(
+    host = cfg$host,
+    port = cfg$port %||% 5432,
+    user = cfg$user,
+    password = cfg$password,
+    dbname = cfg$dbname,
+    sslmode = cfg$sslmode %||% "require"
+  )
+  if (nzchar(cfg$channel_binding %||% "")) {
+    params$channel_binding <- cfg$channel_binding
+  }
+  tryCatch(
+    do.call(DBI::dbConnect, c(list(RPostgres::Postgres()), params)),
+    error = function(e) NULL
+  )
+}
+
+ensure_manual_velocity_table <- function(con) {
+  DBI::dbExecute(con, "
+    CREATE TABLE IF NOT EXISTS manual_velocity_entries (
+      id TEXT PRIMARY KEY,
+      app_id TEXT NOT NULL,
+      entry_date DATE,
+      pitcher TEXT,
+      throw_type TEXT,
+      plyo_drill TEXT,
+      ball_weight_oz NUMERIC,
+      velocity_mph NUMERIC,
+      notes TEXT,
+      created_at TIMESTAMP
+    )
+  ")
+  DBI::dbExecute(con, "
+    CREATE INDEX IF NOT EXISTS idx_manual_velocity_app_id
+    ON manual_velocity_entries(app_id)
+  ")
+}
+
+load_manual_velocity_entries <- function(app_id = current_school()) {
+  app_id_scalar <- as.character(app_id %||% current_school())
+  app_id_scalar <- app_id_scalar[!is.na(app_id_scalar) & nzchar(app_id_scalar)]
+  app_id_scalar <- if (length(app_id_scalar)) app_id_scalar[[1]] else as.character(current_school())
+
+  empty_tbl <- tibble::tibble(
+    id = character(),
+    app_id = character(),
+    entry_date = as.Date(character()),
+    pitcher = character(),
+    throw_type = character(),
+    plyo_drill = character(),
+    ball_weight_oz = double(),
+    velocity_mph = double(),
+    notes = character(),
+    created_at = as.POSIXct(character())
+  )
+
+  backend <- manual_velocity_backend()
+  df <- NULL
+
+  if (identical(backend$type, "postgres")) {
+    con <- manual_velocity_db_connect()
+    if (!is.null(con)) {
+      on.exit(tryCatch(DBI::dbDisconnect(con), error = function(e) NULL), add = TRUE)
+      try(ensure_manual_velocity_table(con), silent = TRUE)
+      quoted_app <- DBI::dbQuoteString(con, app_id_scalar)
+      sql <- sprintf(
+        "SELECT id, app_id, entry_date, pitcher, throw_type, plyo_drill, ball_weight_oz, velocity_mph, notes, created_at
+         FROM manual_velocity_entries
+         WHERE app_id = %s
+         ORDER BY entry_date DESC, created_at DESC",
+        quoted_app
+      )
+      df <- tryCatch(DBI::dbGetQuery(con, sql), error = function(e) NULL)
+    }
+  }
+
+  if (is.null(df)) {
+    ensure_workload_data_dir()
+    path <- manual_velocity_entries_path()
+    if (!file.exists(path)) return(empty_tbl)
+    df <- tryCatch(
+      readr::read_csv(path, col_types = readr::cols(.default = readr::col_guess()), show_col_types = FALSE),
+      error = function(e) empty_tbl
+    )
+  }
+
+  if (!"id" %in% names(df)) df$id <- sprintf("legacy_%s", seq_len(nrow(df)))
+  if (!"app_id" %in% names(df)) df$app_id <- rep(app_id_scalar, nrow(df))
+  if (!"entry_date" %in% names(df)) df$entry_date <- as.Date(NA_real_)[seq_len(nrow(df))]
+  if (!"pitcher" %in% names(df)) df$pitcher <- character(nrow(df))
+  if (!"throw_type" %in% names(df)) df$throw_type <- character(nrow(df))
+  if (!"plyo_drill" %in% names(df)) df$plyo_drill <- character(nrow(df))
+  if (!"ball_weight_oz" %in% names(df)) df$ball_weight_oz <- rep(NA_real_, nrow(df))
+  if (!"velocity_mph" %in% names(df)) df$velocity_mph <- rep(NA_real_, nrow(df))
+  if (!"notes" %in% names(df)) df$notes <- character(nrow(df))
+  if (!"created_at" %in% names(df)) df$created_at <- rep(as.character(Sys.time()), nrow(df))
+  df <- df %>%
+    dplyr::mutate(
+      app_id = app_id_scalar,
+      entry_date = suppressWarnings(as.Date(entry_date)),
+      pitcher = as.character(pitcher %||% ""),
+      throw_type = as.character(throw_type %||% ""),
+      plyo_drill = as.character(plyo_drill %||% ""),
+      ball_weight_oz = suppressWarnings(as.numeric(ball_weight_oz)),
+      velocity_mph = suppressWarnings(as.numeric(velocity_mph)),
+      notes = as.character(notes %||% ""),
+      created_at = suppressWarnings(as.POSIXct(created_at, tz = "UTC"))
+    )
+  df[df$app_id == app_id_scalar, , drop = FALSE]
+}
+
+save_manual_velocity_entries <- function(entries, app_id = current_school()) {
+  app_id_scalar <- as.character(app_id %||% current_school())
+  app_id_scalar <- app_id_scalar[!is.na(app_id_scalar) & nzchar(app_id_scalar)]
+  app_id_scalar <- if (length(app_id_scalar)) app_id_scalar[[1]] else as.character(current_school())
+
+  backend <- manual_velocity_backend()
+
+  ensure_workload_data_dir()
+  path <- manual_velocity_entries_path()
+  normalize_manual_velocity_types <- function(df) {
+    if (is.null(df) || !nrow(df)) return(as.data.frame(df, stringsAsFactors = FALSE))
+    if (!"id" %in% names(df)) df$id <- sprintf("mv_legacy_%s", seq_len(nrow(df)))
+    if (!"app_id" %in% names(df)) df$app_id <- rep(app_id_scalar, nrow(df))
+    if (!"entry_date" %in% names(df)) df$entry_date <- as.Date(NA_real_)[seq_len(nrow(df))]
+    if (!"pitcher" %in% names(df)) df$pitcher <- character(nrow(df))
+    if (!"throw_type" %in% names(df)) df$throw_type <- character(nrow(df))
+    if (!"plyo_drill" %in% names(df)) df$plyo_drill <- character(nrow(df))
+    if (!"ball_weight_oz" %in% names(df)) df$ball_weight_oz <- rep(NA_real_, nrow(df))
+    if (!"velocity_mph" %in% names(df)) df$velocity_mph <- rep(NA_real_, nrow(df))
+    if (!"notes" %in% names(df)) df$notes <- character(nrow(df))
+    if (!"created_at" %in% names(df)) df$created_at <- rep(as.character(Sys.time()), nrow(df))
+    df %>%
+      dplyr::mutate(
+        id = as.character(id),
+        app_id = as.character(app_id),
+        entry_date = suppressWarnings(as.Date(entry_date)),
+        pitcher = as.character(pitcher),
+        throw_type = as.character(throw_type),
+        plyo_drill = as.character(plyo_drill),
+        ball_weight_oz = suppressWarnings(as.numeric(ball_weight_oz)),
+        velocity_mph = suppressWarnings(as.numeric(velocity_mph)),
+        notes = as.character(notes),
+        created_at = suppressWarnings(as.POSIXct(created_at, tz = "UTC"))
+      ) %>%
+      dplyr::select(id, app_id, entry_date, pitcher, throw_type, plyo_drill, ball_weight_oz, velocity_mph, notes, created_at)
+  }
+
+  entries <- normalize_manual_velocity_types(entries)
+
+  if (identical(backend$type, "postgres")) {
+    con <- manual_velocity_db_connect()
+    if (!is.null(con)) {
+      on.exit(tryCatch(DBI::dbDisconnect(con), error = function(e) NULL), add = TRUE)
+      ok <- tryCatch({
+        ensure_manual_velocity_table(con)
+        DBI::dbBegin(con)
+        quoted_app <- DBI::dbQuoteString(con, app_id_scalar)
+        DBI::dbExecute(con, sprintf("DELETE FROM manual_velocity_entries WHERE app_id = %s", quoted_app))
+        if (nrow(entries)) {
+          DBI::dbWriteTable(con, "manual_velocity_entries", entries, append = TRUE, row.names = FALSE)
+        }
+        DBI::dbCommit(con)
+        TRUE
+      }, error = function(e) {
+        tryCatch(DBI::dbRollback(con), error = function(e2) NULL)
+        FALSE
+      })
+      if (isTRUE(ok)) return(invisible(TRUE))
+    }
+  }
+
+  existing <- if (file.exists(path)) {
+    suppressMessages(readr::read_csv(path, show_col_types = FALSE))
+  } else {
+    tibble::tibble()
+  }
+  existing <- normalize_manual_velocity_types(existing)
+  keep_existing <- if (nrow(existing) && "app_id" %in% names(existing)) {
+    dplyr::filter(existing, app_id != !!app_id)
+  } else {
+    tibble::tibble()
+  }
+  combined <- dplyr::bind_rows(keep_existing, entries)
+  readr::write_csv(combined, path)
+}
+
 workload_session_bucket <- function(session_type) {
   st <- tolower(as.character(session_type))
   st[is.na(st)] <- ""
@@ -21354,6 +22326,7 @@ workload_session_bucket_weights <- c(
 # ==================================
 # == AUTHENTICATION SETUP ==
 # ==================================
+log_startup_timing("Reached authentication/global setup boundary")
 
 # Using shinyapps.io native authentication instead of shinymanager
 # Three-tier access system:
@@ -21366,11 +22339,17 @@ admin_emails <- c(
   "ahalverson@pitchingcoachu.com"
 )
 
+# Only this account can publish custom reports/tables as GLOBAL across schools.
+global_share_emails <- c(
+  "jgaynor@pitchingcoachu.com"
+)
+
 # Coach emails - defined per-school via `config/school_config.R`
 # Players are identified by their email being in the lookup_table.csv Email column
 # They will only see data where Email matches their login email
 
 
+log_startup_timing("Starting UI object construction")
 ui <- tagList(
   # --- Custom navbar colors & styling ---
   tags$head(
@@ -21595,9 +22574,6 @@ ui <- tagList(
           var clone = target.cloneNode(true);
           clone.classList.add('creport-pdf-clone');
           clone.classList.add(isDark ? 'creport-pdf-dark' : 'creport-pdf-light');
-          if (clone.querySelector('.creport-row-note')) {
-            clone.classList.add('creport-pdf-has-row-notes');
-          }
 
           // Keep PDF panel sizing identical to live dashboard sizing.
           var liveGrid = target.querySelector('.creport-grid');
@@ -21785,14 +22761,11 @@ ui <- tagList(
       .creport-pdf-clone [id$='report_canvas'] {
         margin-left: 0 !important;
       }
-      .creport-pdf-clone.creport-pdf-has-row-notes [id$='report_canvas_wrapper'] {
-        padding-left: 56px !important;
-      }
-      .creport-pdf-clone.creport-pdf-has-row-notes [id$='report_canvas'] {
-        margin-left: -56px !important;
-      }
       .creport-pdf-clone .creport-row-wrap-has-gutter {
         padding-left: 56px !important;
+      }
+      .creport-pdf-clone .creport-row-wrap-has-gutter > .row {
+        margin-left: -56px !important;
       }
       .creport-pdf-clone .creport-row-note {
         left: 8px !important;
@@ -21800,17 +22773,6 @@ ui <- tagList(
         z-index: 25 !important;
         opacity: 1 !important;
         visibility: visible !important;
-      }
-      .creport-pdf-clone .creport-row-wrap {
-        margin-bottom: 30px !important;
-      }
-      .creport-pdf-clone .creport-row-wrap:last-child {
-        margin-bottom: 0 !important;
-      }
-      .creport-pdf-clone .creport-cell-toolbar,
-      .creport-pdf-clone .creport-controls-toggle,
-      .creport-pdf-clone .creport-hidden-toggle {
-        display: none !important;
       }
       .creport-pdf-clone .creport-row-note-text {
         color: #111111 !important;
@@ -23049,13 +24011,13 @@ ui <- tagList(
     tabPanel("Logout", value = "Logout", fluidPage())
   )
 )
+log_startup_timing("Completed UI object construction")
 
 # Custom authentication disabled - using shinyapps.io native authentication
 
 
 # Server logic
 server <- function(input, output, session) {
-  
   # Get user email from shinyapps.io authentication
   # In shinyapps.io, session$user contains the authenticated user's email
   user_email <- reactive({
@@ -23075,6 +24037,12 @@ server <- function(input, output, session) {
     u <- user_email()
     !is.na(u) && u %in% admin_emails
   })
+
+  can_share_global <- reactive({
+    u <- tolower(trimws(as.character(user_email() %||% "")))
+    allowed <- tolower(trimws(as.character(global_share_emails)))
+    any(vapply(allowed, function(em) nzchar(em) && grepl(em, u, fixed = TRUE), logical(1)))
+  })
   
   # Check if current user is a coach (can see all data)
   is_coach <- reactive({
@@ -23084,6 +24052,31 @@ server <- function(input, output, session) {
   
   # Helper to normalize email for comparison
   norm_email <- function(x) tolower(trimws(as.character(x)))
+  
+  trigger_video_intent_warmup <- function(reason = "intent") {
+    if (!isTRUE(defer_video_map_load) || !isTRUE(video_map_warmup_enabled)) return(invisible(FALSE))
+    if (isTRUE(video_map_warmup_started) || isTRUE(video_map_warmup_completed)) return(invisible(FALSE))
+    message("🎬 Video intent detected: ", reason)
+    start_video_map_warmup(0L)
+  }
+  
+  observeEvent(input$withVideo, {
+    if (identical(input$withVideo, "Yes")) {
+      trigger_video_intent_warmup("withVideo=Yes")
+    }
+  }, ignoreInit = TRUE)
+  
+  observeEvent(input$pitch_click_action, {
+    if (identical(input$pitch_click_action, "video")) {
+      trigger_video_intent_warmup("pitch_click_action=video")
+    }
+  }, ignoreInit = TRUE)
+  
+  observeEvent(input$top, {
+    if (identical(input$top, "Video Upload")) {
+      trigger_video_intent_warmup("entered Video Upload tab")
+    }
+  }, ignoreInit = TRUE)
   
   # Initialize database on startup
   init_modifications_db()
@@ -23240,6 +24233,17 @@ server <- function(input, output, session) {
     
     ""
   }
+
+  ensure_videos_attached <- function(df) {
+    if (is.null(df) || !is.data.frame(df)) return(df)
+    tryCatch(
+      attach_video_clips_lazy(df),
+      error = function(e) {
+        message("⚠️  Deferred video attach failed: ", e$message)
+        ensure_video_clip_columns(df)
+      }
+    )
+  }
   
   fmt_num <- function(digits = 1, unit = "") {
     function(x) {
@@ -23307,14 +24311,21 @@ deg_to_clock <- function(x) {
   
   # --- helpers ---
   format_name_first_last <- function(x) {
-    s <- as.character(x %||% "")
-    if (!nzchar(s)) return("\u2014")
-    # If "Last, First", flip it
-    if (grepl(",", s, fixed = TRUE)) {
-      parts <- trimws(strsplit(s, ",", fixed = TRUE)[[1]])
-      if (length(parts) >= 2) return(paste(parts[2], parts[1]))
+    vals <- as.character(x)
+    out <- trimws(vals)
+    out[!nzchar(out)] <- NA_character_
+    has_comma <- !is.na(out) & grepl(",", out, fixed = TRUE)
+    if (any(has_comma, na.rm = TRUE)) {
+      out[has_comma] <- vapply(out[has_comma], function(nm) {
+        parts <- trimws(strsplit(nm, ",", fixed = TRUE)[[1]])
+        if (length(parts) >= 2 && nzchar(parts[1]) && nzchar(parts[2])) {
+          paste(parts[2], parts[1])
+        } else {
+          nm
+        }
+      }, character(1))
     }
-    s
+    out
   }
   
   # Helpers (keep these near your other helpers)
@@ -24253,7 +25264,7 @@ deg_to_clock <- function(x) {
       x = c(-0.75, 0.75, 0.75, 0, -0.75),
       y = c(1.05, 1.05, 1.15, 1.25, 1.15) - 0.5
     )
-    cz <- data.frame(xmin = -1.5, xmax = 1.5, ymin = 2.65 - 1.5, ymax = 2.65 + 1.5)
+    cz <- data.frame(xmin = -1.5, xmax = 1.5, ymin = ((ZONE_BOTTOM + ZONE_TOP) / 2) - 1.5, ymax = ((ZONE_BOTTOM + ZONE_TOP) / 2) + 1.5)
     sz <- data.frame(xmin = ZONE_LEFT, xmax = ZONE_RIGHT, ymin = ZONE_BOTTOM, ymax = ZONE_TOP)
 
     p <- ggplot() +
@@ -24262,6 +25273,7 @@ deg_to_clock <- function(x) {
                 inherit.aes = FALSE, fill = NA, linetype = "dashed", color = line_col) +
       geom_rect(data = sz, aes(xmin = xmin, xmax = xmax, ymin = ymin, ymax = ymax),
                 inherit.aes = FALSE, fill = NA, color = line_col) +
+      zone_nine_square_layers(color = line_col) +
       coord_fixed(ratio = 1, xlim = c(-2.5, 2.5), ylim = c(0, 4.5)) +
       theme_void() +
       theme(
@@ -24491,6 +25503,7 @@ deg_to_clock <- function(x) {
   
   show_pitch_video_sequence <- function(rows, label = NULL, start_index = 1,
                                         compare_pool = NULL, primary_pool_idx = NA_integer_) {
+    trigger_video_intent_warmup("open video modal")
     rows_df <- tryCatch(as.data.frame(rows), error = function(e) NULL)
     if (is.null(rows_df) || !nrow(rows_df)) {
       showModal(modalDialog("No video available for this selection.", easyClose = TRUE, footer = NULL))
@@ -24498,6 +25511,7 @@ deg_to_clock <- function(x) {
     }
     
     rows_df <- as.data.frame(rows_df, stringsAsFactors = FALSE)
+    rows_df <- ensure_videos_attached(rows_df)
     if (is.null(rownames(rows_df))) rownames(rows_df) <- as.character(seq_len(nrow(rows_df)))
     n_total <- nrow(rows_df)
     clip1 <- tryCatch(as.character(rows_df$VideoClip),  error = function(e) rep("", n_total))
@@ -24514,6 +25528,7 @@ deg_to_clock <- function(x) {
       tryCatch(as.data.frame(compare_pool, stringsAsFactors = FALSE), error = function(e) NULL)
     } else rows_df
     if (is.null(pool_df)) pool_df <- rows_df[0, , drop = FALSE]
+    pool_df <- ensure_videos_attached(pool_df)
     if (is.null(rownames(pool_df))) rownames(pool_df) <- as.character(seq_len(nrow(pool_df)))
     
     pool_clip1 <- tryCatch(as.character(pool_df$VideoClip),  error = function(e) rep("", nrow(pool_df)))
@@ -26990,13 +28005,24 @@ deg_to_clock <- function(x) {
   
   # Global persistent date range - initializes to most recent date on startup
   global_date_range <- reactiveVal()
+  coerce_date_pair <- function(x) {
+    if (is.null(x) || length(x) != 2) return(NULL)
+    d <- suppressWarnings(as.Date(x))
+    if (length(d) != 2 || any(is.na(d)) || any(!is.finite(d))) return(NULL)
+    d
+  }
   
   # Initialize global date range on startup
   observe({
     if (is.null(global_date_range())) {
       if (exists("pitch_data") && nrow(pitch_data) > 0) {
-        max_date <- max(pitch_data$Date, na.rm = TRUE)
-        global_date_range(c(max_date, max_date))
+        win <- recent_date_window(pitch_data$Date, n_days = 7L)
+        if (!is.null(win)) {
+          global_date_range(win)
+        } else {
+          today <- Sys.Date()
+          global_date_range(c(today, today))
+        }
       } else {
         global_date_range(c(Sys.Date(), Sys.Date()))
       }
@@ -27005,22 +28031,23 @@ deg_to_clock <- function(x) {
   
   # Update global date range when main input changes
   observeEvent(input$dates, {
-    if (!is.null(input$dates) && length(input$dates) == 2) {
+    d_in <- coerce_date_pair(input$dates)
+    if (!is.null(d_in)) {
       # Only update if the dates are actually different to prevent loops
-      current_global <- global_date_range()
-      if (is.null(current_global) || 
-          !identical(as.Date(input$dates), as.Date(current_global))) {
-        global_date_range(input$dates)
+      current_global <- coerce_date_pair(global_date_range())
+      if (is.null(current_global) || !identical(d_in, current_global)) {
+        global_date_range(d_in)
       }
     }
   })
   
   # Sync date range input with global value - only when global changes
   observe({
-    global_dates <- global_date_range()
-    if (!is.null(global_dates) && !is.null(input$dates)) {
+    global_dates <- coerce_date_pair(global_date_range())
+    input_dates <- coerce_date_pair(input$dates)
+    if (!is.null(global_dates)) {
       # Only update UI if the values are actually different to prevent loops
-      if (!identical(as.Date(input$dates), as.Date(global_dates))) {
+      if (is.null(input_dates) || !identical(input_dates, global_dates)) {
         updateDateRangeInput(session, "dates", 
                              start = global_dates[1], 
                              end = global_dates[2])
@@ -27111,7 +28138,7 @@ deg_to_clock <- function(x) {
       on.exit(dbDisconnect(con), add = TRUE)
       tbl <- as.character(pitch_mod_table_clause(con))
       ns_clause <- pitch_mod_namespace_clause(con)
-      mods <- try(dbGetQuery(con, sprintf("SELECT * FROM %s WHERE namespace = %s ORDER BY created_at", tbl, ns_clause)), silent = TRUE)
+      mods <- try(db_get_query_safe(con, sprintf("SELECT * FROM %s WHERE namespace = %s ORDER BY created_at", tbl, ns_clause)), silent = TRUE)
       if (inherits(mods, "try-error") || !nrow(mods)) {
         readr::write_csv(data.frame(message = "No pitch edits saved yet"), file)
       } else {
@@ -27272,7 +28299,7 @@ deg_to_clock <- function(x) {
     # pull current filters
     ds <- input$dates[1]; de <- input$dates[2]
     pit <- input$pitcher %or% "All"
-    st  <- input$sessionType %or% "Season"
+    st  <- input$sessionType %or% "All"
     sui <- current_suite()
     pag <- current_page()
     
@@ -27470,19 +28497,26 @@ deg_to_clock <- function(x) {
     }, delay = 0.3)
   }, ignoreInit = TRUE)
   
-  # Set date once on startup
+  # Set date once on startup (prefer persisted global range over single-day defaults).
   observeEvent(TRUE, {
     req(input$sessionType, input$pitcher)
-    df_base <- apply_session_type_filter(pitch_data_pitching, input$sessionType)
     
-    last_date <- if (input$pitcher == "All") {
-      max(df_base$Date, na.rm = TRUE)
-    } else {
-      mx <- max(df_base$Date[df_base$Pitcher == input$pitcher], na.rm = TRUE)
-      if (is.finite(mx)) mx else max(df_base$Date, na.rm = TRUE)
+    if (!is.null(global_date_range())) {
+      gd <- global_date_range()
+      updateDateRangeInput(session, "dates", start = gd[[1]], end = gd[[2]])
+      return()
     }
-    if (is.finite(last_date)) {
-      updateDateRangeInput(session, "dates", start = last_date, end = last_date)
+    
+    df_base <- apply_session_type_filter(pitch_data_pitching, input$sessionType)
+    date_pool <- if (input$pitcher == "All") {
+      df_base$Date
+    } else {
+      df_base$Date[df_base$Pitcher == input$pitcher]
+    }
+    win <- recent_date_window(date_pool, n_days = 7L)
+    if (!is.null(win)) {
+      updateDateRangeInput(session, "dates", start = win[[1]], end = win[[2]])
+      global_date_range(win)
     }
   }, once = TRUE)
   
@@ -27504,16 +28538,17 @@ deg_to_clock <- function(x) {
                              end = global_dates[2])
       }
     } else {
-      # Only fall back to last date if no global date range is set
-      last_date <- if (input$pitcher == "All") {
-        max(pitch_data_pitching$Date, na.rm = TRUE)
+      # Only fall back if no global date range is set
+      date_pool <- if (input$pitcher == "All") {
+        pitch_data_pitching$Date
       } else {
-        max(pitch_data_pitching$Date[pitch_data_pitching$Pitcher == input$pitcher], na.rm = TRUE)
+        pitch_data_pitching$Date[pitch_data_pitching$Pitcher == input$pitcher]
       }
-      if (is.finite(last_date)) {
-        updateDateRangeInput(session, "dates", start = last_date, end = last_date)
-        # Update global date range with this new value
-        global_date_range(c(last_date, last_date))
+      win <- recent_date_window(date_pool, n_days = 7L)
+      if (!is.null(win)) {
+        updateDateRangeInput(session, "dates", start = win[[1]], end = win[[2]])
+        # Update global date range with this new value.
+        global_date_range(win)
       }
     }
   }, ignoreInit = TRUE)
@@ -27575,7 +28610,7 @@ deg_to_clock <- function(x) {
     # --- context for the note ---
     ds <- input$dates[1]; de <- input$dates[2]
     pit <- input$pitcher     %or% "All"
-    st  <- input$sessionType %or% "Season"
+    st  <- input$sessionType %or% "All"
     sui <- current_suite();  pag <- current_page()
     page_combo <- paste0(sui, "::", pag %or% "")
     
@@ -27666,7 +28701,7 @@ deg_to_clock <- function(x) {
               div(style = "margin-bottom: 2px; font-weight: bold; font-size: 12px;", "Split By:"),
               selectInput(
                 "summarySplitBy", label = NULL,
-                choices = c("Pitch Types", "Batter Hand", "Count", "After Count", "Velocity", "IVB", "HB", "Batter"),
+                choices = pitching_split_by_choices,
                 selected = split_sel,
                 width = "140px"
               )
@@ -27684,7 +28719,7 @@ deg_to_clock <- function(x) {
             multiple = TRUE,
             options  = list(plugins = list("drag_drop","remove_button"), placeholder = "Choose columns…")
           ),
-          if (isTRUE(is_admin())) {
+          if (isTRUE(can_share_global())) {
             checkboxInput("summaryCustomGlobal", "Share with all schools (admin)", value = FALSE)
           },
           actionButton("summarySaveCustom", "Save / Update", class = "btn-primary btn-sm"),
@@ -27727,7 +28762,7 @@ deg_to_clock <- function(x) {
               div(style = "margin-bottom: 2px; font-weight: bold; font-size: 12px;", "Split By:"),
               selectInput(
                 "dpSplitBy", label = NULL,
-                choices = c("Pitch Types", "Batter Hand", "Count", "After Count", "Velocity", "IVB", "HB", "Batter"),
+                choices = pitching_split_by_choices,
                 selected = split_sel,
                 width = "140px"
               )
@@ -27745,7 +28780,7 @@ deg_to_clock <- function(x) {
             multiple = TRUE,
             options  = list(plugins = list("drag_drop","remove_button"), placeholder = "Choose columns…")
           ),
-          if (isTRUE(is_admin())) {
+          if (isTRUE(can_share_global())) {
             checkboxInput("dpCustomGlobal", "Share with all schools (admin)", value = FALSE)
           },
           actionButton("dpSaveCustom", "Save / Update", class = "btn-primary btn-sm"),
@@ -27780,28 +28815,46 @@ deg_to_clock <- function(x) {
     )
   })
   
+  apply_pitching_team_filter <- function(df, team_type = "All") {
+    if (is.null(df) || !nrow(df) || !"Pitcher" %in% names(df)) return(df)
+    team_type <- team_type %||% "All"
+    if (!nzchar(team_type) || identical(team_type, "All")) return(df)
+    pitcher_chr <- as.character(df$Pitcher %||% "")
+    pitcher_norm <- norm_name_ci(pitcher_chr)
+    campers_norm <- norm_name_ci(ALLOWED_CAMPERS_DL)
+    team_norm <- norm_name_ci(ALLOWED_PITCHERS_DL)
+    known_norm <- unique(c(campers_norm, team_norm))
+    mask <- switch(
+      team_type,
+      "Campers" = pitcher_norm %in% campers_norm,
+      TEAM_CODE = pitcher_norm %in% team_norm,
+      "Opponents" = !(pitcher_norm %in% known_norm),
+      rep(TRUE, length(pitcher_chr))
+    )
+    mask[is.na(mask)] <- FALSE
+    df[mask, , drop = FALSE]
+  }
+  
+  pitching_base_for_team <- function(team_type = "All", include_modifications = TRUE) {
+    team_type <- team_type %||% "All"
+    if (identical(team_type, "Opponents")) return(pitch_data)
+    if (isTRUE(include_modifications)) {
+      df_mod <- tryCatch(modified_pitch_data(), error = function(e) NULL)
+      if (!is.null(df_mod) && nrow(df_mod)) return(df_mod)
+    }
+    pitch_data_pitching
+  }
+  
   # 1) Pitcher selector
   output$pitcher_ui <- renderUI({
     req(input$sessionType, input$teamType)
     
-    df_base <- apply_session_type_filter(pitch_data_pitching, input$sessionType)
-    
-    # Apply team filtering to get the available pitchers
-    if (input$teamType == "Campers") {
-      df_base <- dplyr::filter(df_base, Pitcher %in% ALLOWED_CAMPERS)
-    } else if (input$teamType == TEAM_CODE) {
-      # Filter to only GCU allowed pitchers (exclude campers)
-      df_base <- dplyr::filter(df_base, Pitcher %in% ALLOWED_PITCHERS)
-    }
-    # If "All" is selected, df_base already contains all pitchers
+    df_base <- apply_session_type_filter(pitching_base_for_team(input$teamType, include_modifications = FALSE), input$sessionType)
+    df_base <- apply_pitching_team_filter(df_base, input$teamType)
     
     # Create name map for the filtered dataset
     raw_names_team <- sort(unique(df_base$Pitcher))
-    display_names_team <- ifelse(
-      grepl(",", raw_names_team),
-      vapply(strsplit(raw_names_team, ",\\s*"), function(x) paste(x[2], x[1]), ""),
-      raw_names_team
-    )
+    display_names_team <- format_name_first_last(raw_names_team)
     name_map_team <- setNames(raw_names_team, display_names_team)
     
     # Determine which pitchers the user can see:
@@ -27849,24 +28902,350 @@ deg_to_clock <- function(x) {
   observeEvent(list(input$sessionType, input$teamType), {
     req(input$sessionType, input$teamType)
     
-    df_base <- apply_session_type_filter(pitch_data_pitching, input$sessionType)
+    df_base <- apply_session_type_filter(pitching_base_for_team(input$teamType, include_modifications = FALSE), input$sessionType)
+    df_base <- apply_pitching_team_filter(df_base, input$teamType)
     
-    # Apply team filtering
-    if (input$teamType == "Campers") {
-      df_base <- dplyr::filter(df_base, Pitcher %in% ALLOWED_CAMPERS)
-    } else if (input$teamType == TEAM_CODE) {
-      df_base <- dplyr::filter(df_base, Pitcher %in% ALLOWED_PITCHERS)
-    }
-    # If "All" is selected, don't filter - show all data
-    
+    if (!("Date" %in% names(df_base))) return()
+    all_dates <- suppressWarnings(as.Date(df_base$Date))
+    all_dates <- all_dates[is.finite(all_dates)]
+    if (!length(all_dates)) return()
     last_date <- if (is.null(input$pitcher) || input$pitcher == "All") {
-      max(df_base$Date, na.rm = TRUE)
+      max(all_dates, na.rm = TRUE)
     } else {
-      ld <- max(df_base$Date[df_base$Pitcher == input$pitcher], na.rm = TRUE)
-      if (is.finite(ld)) ld else max(df_base$Date, na.rm = TRUE)
+      pit_dates <- suppressWarnings(as.Date(df_base$Date[df_base$Pitcher == input$pitcher]))
+      pit_dates <- pit_dates[is.finite(pit_dates)]
+      if (length(pit_dates)) max(pit_dates, na.rm = TRUE) else max(all_dates, na.rm = TRUE)
     }
-    updateDateRangeInput(session, "dates", start = last_date, end = last_date)
+    if (length(last_date) == 1 && is.finite(last_date)) {
+      updateDateRangeInput(session, "dates", start = last_date, end = last_date)
+    }
   }, ignoreInit = TRUE)
+  
+  observe({
+    req(input$sessionType, input$teamType)
+    df_base <- apply_session_type_filter(pitching_base_for_team(input$teamType, include_modifications = FALSE), input$sessionType)
+    df_base <- apply_pitching_team_filter(df_base, input$teamType)
+    pit <- input$pitcher %||% "All"
+    if (!identical(pit, "All") && "Pitcher" %in% names(df_base)) {
+      df_base <- dplyr::filter(df_base, Pitcher == pit)
+    }
+    if (!is.null(input$dates) && length(input$dates) == 2 && all(is.finite(input$dates)) && "Date" %in% names(df_base)) {
+      df_base <- dplyr::filter(df_base, Date >= input$dates[1], Date <= input$dates[2])
+    }
+    hitters <- sort(unique(stats::na.omit(as.character(df_base$Batter))))
+    hitter_choices <- c("All" = "All", setNames(hitters, format_name_first_last(hitters)))
+    current <- isolate(input$oppHitter)
+    if (is.null(current) || !(current %in% unname(hitter_choices))) current <- "All"
+    updateSelectInput(session, "oppHitter", choices = hitter_choices, selected = current)
+  })
+
+  # ---- Manual Velocity Entry (Pitching Suite) ----
+  manual_velocity_entries <- reactiveVal(load_manual_velocity_entries(current_school()))
+  manual_velo_status <- reactiveVal("")
+
+  observe({
+    df <- manual_velocity_entries()
+    pitchers_from_data <- sort(unique(stats::na.omit(as.character(pitch_data_pitching$Pitcher))))
+    pitchers_from_manual <- sort(unique(stats::na.omit(as.character(df$pitcher))))
+    raw_pitchers <- sort(unique(c(pitchers_from_data, pitchers_from_manual)))
+    if (!length(raw_pitchers)) raw_pitchers <- "All"
+    pitcher_choices <- c("All" = "All", setNames(raw_pitchers, format_name_first_last(raw_pitchers)))
+    pitcher_values <- unname(pitcher_choices)
+
+    selected_entry_pitcher <- isolate(input$manualVeloPitcher)
+    if (is.null(selected_entry_pitcher) || !(selected_entry_pitcher %in% pitcher_values)) {
+      selected_entry_pitcher <- if (!is.null(input$pitcher) && input$pitcher %in% pitcher_values) input$pitcher else "All"
+    }
+    updateSelectInput(session, "manualVeloPitcher", choices = pitcher_choices, selected = selected_entry_pitcher)
+
+    selected_filter_pitcher <- isolate(input$manualVeloPitcherFilter)
+    if (is.null(selected_filter_pitcher) || !(selected_filter_pitcher %in% pitcher_values)) {
+      selected_filter_pitcher <- "All"
+    }
+    updateSelectInput(session, "manualVeloPitcherFilter", choices = pitcher_choices, selected = selected_filter_pitcher)
+
+    type_vals <- sort(unique(stats::na.omit(as.character(df$throw_type))))
+    type_choices <- c("All", type_vals)
+    current_types <- isolate(input$manualVeloTypeFilter)
+    if (is.null(current_types) || !length(current_types)) current_types <- "All"
+    current_types <- current_types[current_types %in% type_choices]
+    if (!length(current_types)) current_types <- "All"
+    updateSelectInput(session, "manualVeloTypeFilter", choices = type_choices, selected = current_types)
+
+    plyo_choices <- sort(unique(stats::na.omit(as.character(df$plyo_drill[df$throw_type == "Plyo Velo"]))))
+    current_plyo <- isolate(input$manualVeloPlyoDrill)
+    if (is.null(current_plyo)) current_plyo <- ""
+    updateSelectizeInput(
+      session, "manualVeloPlyoDrill",
+      choices = c("", plyo_choices),
+      selected = if (nzchar(trimws(current_plyo))) current_plyo else ""
+    )
+
+    w <- suppressWarnings(as.numeric(df$ball_weight_oz))
+    w <- w[is.finite(w)]
+    w_min <- if (length(w)) floor(min(w) * 4) / 4 else 0.5
+    w_max <- if (length(w)) ceiling(max(w) * 4) / 4 else 64
+    if (w_min >= w_max) w_max <- w_min + 1
+    cur_w <- isolate(input$manualVeloWeightRange)
+    if (is.null(cur_w) || length(cur_w) != 2) cur_w <- c(w_min, w_max)
+    cur_w[1] <- max(w_min, cur_w[1]); cur_w[2] <- min(w_max, cur_w[2])
+    if (cur_w[1] > cur_w[2]) cur_w <- c(w_min, w_max)
+    updateSliderInput(session, "manualVeloWeightRange", min = w_min, max = w_max, value = cur_w, step = 0.25)
+  })
+
+  observeEvent(input$manualVeloAdd, {
+    throw_type <- input$manualVeloType %||% "Pulldowns"
+    if (identical(throw_type, "Other")) {
+      throw_type <- trimws(input$manualVeloTypeOther %||% "")
+    }
+    if (!nzchar(throw_type)) {
+      manual_velo_status("Enter a throw type before saving.")
+      return()
+    }
+
+    plyo_drill <- ""
+    if (identical(throw_type, "Plyo Velo")) {
+      plyo_drill <- trimws(input$manualVeloPlyoDrill %||% "")
+      if (!nzchar(plyo_drill)) {
+        manual_velo_status("Enter or select a Plyo Drill for Plyo Velo entries.")
+        return()
+      }
+    }
+
+    split_numeric <- function(x) {
+      if (is.null(x) || !nzchar(trimws(x))) return(numeric(0))
+      toks <- unlist(strsplit(as.character(x), "[,\\s\\n\\t;|]+", perl = TRUE))
+      toks <- toks[nzchar(toks)]
+      vals <- suppressWarnings(as.numeric(toks))
+      vals[is.finite(vals)]
+    }
+    vals <- c(
+      suppressWarnings(as.numeric(input$manualVeloSingle)),
+      split_numeric(input$manualVeloBatch)
+    )
+    vals <- vals[is.finite(vals)]
+    vals <- vals[vals > 0]
+    if (!length(vals)) {
+      manual_velo_status("No valid velocity values found. Use single value or batch values.")
+      return()
+    }
+
+    pitcher_pick <- input$manualVeloPitcher %||% "All"
+    if (!nzchar(pitcher_pick) || identical(pitcher_pick, "All")) {
+      manual_velo_status("Pick a specific pitcher for manual entries.")
+      return()
+    }
+
+    weight <- suppressWarnings(as.numeric(input$manualVeloWeight))
+    if (!is.finite(weight) || weight <= 0) {
+      manual_velo_status("Ball weight must be a positive number.")
+      return()
+    }
+
+    date_val <- suppressWarnings(as.Date(input$manualVeloDate))
+    if (is.na(date_val)) date_val <- Sys.Date()
+
+    now_time <- Sys.time()
+    new_rows <- tibble::tibble(
+      id = sprintf("mv_%s_%s", format(now_time, "%Y%m%d%H%M%OS3"), seq_along(vals)),
+      app_id = current_school(),
+      entry_date = rep(date_val, length(vals)),
+      pitcher = rep(as.character(pitcher_pick), length(vals)),
+      throw_type = rep(as.character(throw_type), length(vals)),
+      plyo_drill = rep(as.character(plyo_drill), length(vals)),
+      ball_weight_oz = rep(weight, length(vals)),
+      velocity_mph = as.numeric(vals),
+      notes = rep(as.character(trimws(input$manualVeloNotes %||% "")), length(vals)),
+      created_at = rep(now_time, length(vals))
+    )
+
+    updated <- dplyr::bind_rows(manual_velocity_entries(), new_rows)
+    manual_velocity_entries(updated)
+    save_manual_velocity_entries(updated)
+
+    manual_velo_status(sprintf("Saved %d %s.", length(vals), ifelse(length(vals) == 1, "entry", "entries")))
+    updateNumericInput(session, "manualVeloSingle", value = NA_real_)
+    updateTextAreaInput(session, "manualVeloBatch", value = "")
+    if (identical(throw_type, "Plyo Velo")) {
+      updateSelectizeInput(session, "manualVeloPlyoDrill", selected = plyo_drill)
+    }
+  })
+
+  output$manualVeloAddStatus <- renderText({ manual_velo_status() })
+
+  output$manualVeloTable <- DT::renderDataTable({
+    df <- manual_velocity_entries() %>%
+      dplyr::arrange(dplyr::desc(entry_date), dplyr::desc(created_at)) %>%
+      dplyr::mutate(
+        Pitcher = format_name_first_last(pitcher),
+        Date = as.character(entry_date),
+        `Throw Type` = throw_type,
+        `Plyo Drill` = dplyr::if_else(throw_type == "Plyo Velo" & nzchar(plyo_drill), plyo_drill, ""),
+        `Ball (oz)` = round(ball_weight_oz, 2),
+        `Velo (mph)` = round(velocity_mph, 1),
+        Notes = notes
+      ) %>%
+      dplyr::select(Date, Pitcher, `Throw Type`, `Plyo Drill`, `Ball (oz)`, `Velo (mph)`, Notes, id)
+
+    if (!nrow(df)) {
+      return(DT::datatable(data.frame(Message = "No manual entries yet"), options = list(dom = "t"), rownames = FALSE))
+    }
+    DT::datatable(
+      df,
+      rownames = FALSE,
+      selection = "single",
+      options = list(pageLength = 12, order = list(list(0, "desc")), columnDefs = list(list(targets = 7, visible = FALSE)))
+    )
+  })
+
+  observeEvent(input$manualVeloDelete, {
+    sel <- input$manualVeloTable_rows_selected
+    if (is.null(sel) || !length(sel)) {
+      manual_velo_status("Select a row in Recent Manual Entries to delete.")
+      return()
+    }
+    df_tbl <- manual_velocity_entries() %>%
+      dplyr::arrange(dplyr::desc(entry_date), dplyr::desc(created_at))
+    if (sel < 1 || sel > nrow(df_tbl)) return()
+    drop_id <- df_tbl$id[sel]
+    updated <- dplyr::filter(manual_velocity_entries(), id != drop_id)
+    manual_velocity_entries(updated)
+    save_manual_velocity_entries(updated)
+    manual_velo_status("Deleted selected entry.")
+  })
+
+  manual_velocity_filtered <- reactive({
+    df <- manual_velocity_entries()
+    if (!nrow(df)) return(df)
+
+    dts <- input$manualVeloDateRange
+    if (!is.null(dts) && length(dts) == 2 && all(!is.na(dts))) {
+      df <- dplyr::filter(df, entry_date >= as.Date(dts[1]), entry_date <= as.Date(dts[2]))
+    }
+    pit <- input$manualVeloPitcherFilter %||% "All"
+    if (!identical(pit, "All")) df <- dplyr::filter(df, pitcher == pit)
+
+    typ <- input$manualVeloTypeFilter %||% "All"
+    if (length(typ) && !("All" %in% typ)) df <- dplyr::filter(df, throw_type %in% typ)
+
+    wr <- input$manualVeloWeightRange
+    if (!is.null(wr) && length(wr) == 2 && all(is.finite(wr))) {
+      df <- dplyr::filter(df, is.finite(ball_weight_oz), ball_weight_oz >= wr[1], ball_weight_oz <= wr[2])
+    }
+    df
+  })
+
+  output$manualVeloKpis <- renderUI({
+    df <- manual_velocity_filtered()
+    if (!nrow(df)) return(div(class = "manual-kpi-wrap", div(class = "manual-kpi", div(class = "label", "Status"), div(class = "value", "No Data"))))
+    avg_v <- mean(df$velocity_mph, na.rm = TRUE)
+    max_v <- max(df$velocity_mph, na.rm = TRUE)
+    n_tot <- nrow(df)
+    n_types <- dplyr::n_distinct(df$throw_type)
+    div(
+      class = "manual-kpi-wrap",
+      div(class = "manual-kpi", div(class = "label", "Entries"), div(class = "value", format(n_tot, big.mark = ","))),
+      div(class = "manual-kpi", div(class = "label", "Average Velo"), div(class = "value", sprintf("%.1f", avg_v))),
+      div(class = "manual-kpi", div(class = "label", "Peak Velo"), div(class = "value", sprintf("%.1f", max_v))),
+      div(class = "manual-kpi", div(class = "label", "Drill Types"), div(class = "value", as.character(n_types)))
+    )
+  })
+
+  output$manualVeloPlot <- renderPlot({
+    df <- manual_velocity_filtered()
+    validate(need(nrow(df) > 0, "No manual velocity data for current filters."))
+    dark_on <- isTRUE(input$dark_mode)
+    text_col <- if (dark_on) "#e5e7eb" else "#111827"
+    bg_col <- if (dark_on) "#0f172a" else "white"
+    grid_col <- if (dark_on) "#334155" else "#d1d5db"
+    chart_mode <- input$manualVeloChartType %||% "Trend by Drill"
+
+    if (identical(chart_mode, "Trend by Drill")) {
+      pdat <- df %>%
+        dplyr::group_by(entry_date, throw_type) %>%
+        dplyr::summarise(mean_velo = mean(velocity_mph, na.rm = TRUE), peak_velo = max(velocity_mph, na.rm = TRUE), .groups = "drop")
+      ggplot(pdat, aes(entry_date, mean_velo, color = throw_type)) +
+        geom_line(linewidth = 1.1) +
+        geom_point(size = 2.2) +
+        geom_point(aes(y = peak_velo), size = 1.6, alpha = 0.6, shape = 17) +
+        labs(title = "Trend by Drill", x = "Date", y = "Velocity (mph)", color = "Throw Type") +
+        theme_minimal(base_size = 13) +
+        theme(
+          text = element_text(color = text_col),
+          panel.background = element_rect(fill = bg_col, color = NA),
+          plot.background = element_rect(fill = bg_col, color = NA),
+          panel.grid.major = element_line(color = grid_col),
+          panel.grid.minor = element_blank(),
+          legend.position = "bottom"
+        )
+    } else if (identical(chart_mode, "Velocity Distribution")) {
+      ggplot(df, aes(throw_type, velocity_mph, fill = throw_type)) +
+        geom_boxplot(alpha = 0.65, outlier.alpha = 0.35) +
+        geom_jitter(width = 0.14, alpha = 0.35, size = 1.6) +
+        labs(title = "Velocity Distribution", x = "Throw Type", y = "Velocity (mph)") +
+        theme_minimal(base_size = 13) +
+        theme(
+          text = element_text(color = text_col),
+          panel.background = element_rect(fill = bg_col, color = NA),
+          plot.background = element_rect(fill = bg_col, color = NA),
+          panel.grid.major = element_line(color = grid_col),
+          panel.grid.minor = element_blank(),
+          legend.position = "none",
+          axis.text.x = element_text(angle = 20, hjust = 1)
+        )
+    } else if (identical(chart_mode, "Weight vs Velocity")) {
+      ggplot(df, aes(ball_weight_oz, velocity_mph, color = throw_type)) +
+        geom_point(alpha = 0.8, size = 2.2) +
+        geom_smooth(method = "lm", se = FALSE, linewidth = 0.9) +
+        labs(title = "Weight vs Velocity", x = "Ball Weight (oz)", y = "Velocity (mph)", color = "Throw Type") +
+        theme_minimal(base_size = 13) +
+        theme(
+          text = element_text(color = text_col),
+          panel.background = element_rect(fill = bg_col, color = NA),
+          plot.background = element_rect(fill = bg_col, color = NA),
+          panel.grid.major = element_line(color = grid_col),
+          panel.grid.minor = element_blank(),
+          legend.position = "bottom"
+        )
+    } else {
+      pdat <- df %>%
+        dplyr::arrange(entry_date, created_at) %>%
+        dplyr::mutate(pr_velo = cummax(velocity_mph))
+      ggplot(pdat, aes(entry_date, pr_velo)) +
+        geom_step(color = "#dc2626", linewidth = 1.2) +
+        geom_point(aes(y = velocity_mph, color = throw_type), alpha = 0.45, size = 1.8) +
+        labs(title = "PR Timeline", x = "Date", y = "Best Velocity To Date (mph)", color = "Throw Type") +
+        theme_minimal(base_size = 13) +
+        theme(
+          text = element_text(color = text_col),
+          panel.background = element_rect(fill = bg_col, color = NA),
+          plot.background = element_rect(fill = bg_col, color = NA),
+          panel.grid.major = element_line(color = grid_col),
+          panel.grid.minor = element_blank(),
+          legend.position = "bottom"
+        )
+    }
+  })
+
+  output$manualVeloSummaryTable <- DT::renderDataTable({
+    df <- manual_velocity_filtered()
+    if (!nrow(df)) {
+      return(DT::datatable(data.frame(Message = "No entries for selected filters"), options = list(dom = "t"), rownames = FALSE))
+    }
+    out <- df %>%
+      dplyr::mutate(plyo_label = dplyr::if_else(throw_type == "Plyo Velo" & nzchar(plyo_drill), plyo_drill, "")) %>%
+      dplyr::group_by(throw_type, plyo_label, ball_weight_oz) %>%
+      dplyr::summarise(
+        Entries = dplyr::n(),
+        `Avg Velo` = round(mean(velocity_mph, na.rm = TRUE), 1),
+        `Peak Velo` = round(max(velocity_mph, na.rm = TRUE), 1),
+        `Min Velo` = round(min(velocity_mph, na.rm = TRUE), 1),
+        .groups = "drop"
+      ) %>%
+      dplyr::arrange(dplyr::desc(`Peak Velo`))
+    names(out) <- c("Throw Type", "Plyo Drill", "Ball (oz)", "Entries", "Avg Velo", "Peak Velo", "Min Velo")
+    DT::datatable(out, rownames = FALSE, options = list(pageLength = 12, order = list(list(5, "desc"))))
+  })
   
   # 2) Filtered data
   filtered_data <- reactive({
@@ -27879,17 +29258,10 @@ deg_to_clock <- function(x) {
     
     pitch_types <- if (is.null(input$pitchType) || !length(input$pitchType)) "All" else input$pitchType
     
-    # Session type - use modified data instead of original
-    df <- apply_session_type_filter(modified_pitch_data(), input$sessionType)
-    
-    # ⛔️ Team filtering - Filter by team selection ⛔️
-    if (!is.null(input$teamType)) {
-      if (input$teamType == "Campers") {
-        # Filter to only allowed campers
-        df <- dplyr::filter(df, Pitcher %in% ALLOWED_CAMPERS)
-      }
-      # If "GCU" is selected, use the existing data (already filtered to ALLOWED_PITCHERS)
-    }
+    # Session type/team source:
+    # Opponents must come from full pitch_data; team/campers use modified pitching data.
+    df <- apply_session_type_filter(pitching_base_for_team(input$teamType, include_modifications = TRUE), input$sessionType)
+    df <- apply_pitching_team_filter(df, input$teamType)
     
     # ⛔️ Drop warmups & blank pitch types
     if ("TaggedPitchType" %in% names(df)) {
@@ -27940,6 +29312,7 @@ deg_to_clock <- function(x) {
     
     # With Video filter
     if (!is.null(input$withVideo) && input$withVideo != "All") {
+      df <- ensure_videos_attached(df)
       vid1 <- nzchar(ifelse(is.na(df$VideoClip),  "", df$VideoClip))
       vid2 <- nzchar(ifelse(is.na(df$VideoClip2), "", df$VideoClip2))
       vid3 <- nzchar(ifelse(is.na(df$VideoClip3), "", df$VideoClip3))
@@ -27995,8 +29368,10 @@ deg_to_clock <- function(x) {
     # protect against NULL during app init
     pitch_types <- if (is.null(input$pitchType)) "All" else input$pitchType
     
-    # first, honor Session Type
-    df <- apply_session_type_filter(pitch_data_pitching, input$sessionType)
+    # Session type/team source:
+    # Opponents must come from full pitch_data; team/campers use pitching dataset.
+    df <- apply_session_type_filter(pitching_base_for_team(input$teamType, include_modifications = FALSE), input$sessionType)
+    df <- apply_pitching_team_filter(df, input$teamType)
     
     # Live-only BatterSide filter
     if (!is.null(input$batterSide) && input$batterSide != "All") {
@@ -28027,6 +29402,7 @@ deg_to_clock <- function(x) {
     
     # With Video filter (leaderboard)
     if (!is.null(input$withVideo) && input$withVideo != "All") {
+      df <- ensure_videos_attached(df)
       vid1 <- nzchar(ifelse(is.na(df$VideoClip),  "", df$VideoClip))
       vid2 <- nzchar(ifelse(is.na(df$VideoClip2), "", df$VideoClip2))
       vid3 <- nzchar(ifelse(is.na(df$VideoClip3), "", df$VideoClip3))
@@ -28168,7 +29544,7 @@ deg_to_clock <- function(x) {
           df$PlateLocHeight >= ZONE_BOTTOM & df$PlateLocHeight <= ZONE_TOP, 1.47,
         ifelse(
           df$PlateLocSide >= -1.5 & df$PlateLocSide <= 1.5 &
-            df$PlateLocHeight >= (2.65 - 1.5) & df$PlateLocHeight <= (2.65 + 1.5),
+            df$PlateLocHeight >= (((ZONE_BOTTOM + ZONE_TOP) / 2) - 1.5) & df$PlateLocHeight <= (((ZONE_BOTTOM + ZONE_TOP) / 2) + 1.5),
           0.73, 0
         )
       )
@@ -28724,7 +30100,7 @@ deg_to_clock <- function(x) {
       x = c(-0.75, 0.75, 0.75, 0, -0.75),
       y = c(1.05, 1.05, 1.15, 1.25, 1.15) - 0.5
     )
-    cz <- data.frame(xmin = -1.5, xmax = 1.5, ymin = 2.65 - 1.5, ymax = 2.65 + 1.5)
+    cz <- data.frame(xmin = -1.5, xmax = 1.5, ymin = ((ZONE_BOTTOM + ZONE_TOP) / 2) - 1.5, ymax = ((ZONE_BOTTOM + ZONE_TOP) / 2) + 1.5)
     sz <- data.frame(xmin = ZONE_LEFT, xmax = ZONE_RIGHT, ymin = ZONE_BOTTOM, ymax = ZONE_TOP)
     
     df_known <- df_i %>% dplyr::filter(!is.na(Result))
@@ -28736,6 +30112,7 @@ deg_to_clock <- function(x) {
                 inherit.aes = FALSE, fill = NA, linetype = "dashed", color = line_col) +
       geom_rect(data = sz, aes(xmin = xmin, xmax = xmax, ymin = ymin, ymax = ymax),
                 inherit.aes = FALSE, fill = NA, color = line_col) +
+      zone_nine_square_layers(color = line_col) +
       
       # filled circles for "no result" rows
       ggiraph::geom_point_interactive(
@@ -28848,9 +30225,7 @@ deg_to_clock <- function(x) {
   safe_pct <- function(num, den) {
     num <- suppressWarnings(as.numeric(num))
     den <- suppressWarnings(as.numeric(den))
-    ifelse(is.finite(den) & den > 0 & is.finite(num),
-           paste0(round(100 * num / den, 1), "%"),
-           "")
+    fmt_pct_ratio(num, den, digits = 1)
   }
   nz_mean <- function(x) {
     x <- suppressWarnings(as.numeric(x))
@@ -28899,10 +30274,13 @@ deg_to_clock <- function(x) {
         "Batter Hand" = "Batter Hand",
         "Count" = "Count",
         "After Count" = "After Count",
+        "Zone Location" = "Zone Location",
+        "Times Through Order" = "Times Through Order",
         "Velocity" = "Velocity",
         "IVB" = "InducedVert",
         "HB" = "HorzBreak",
         "Batter" = "Batter",
+        "Catcher" = "Catcher",
         "Pitch"  # default
       )
       
@@ -29023,7 +30401,7 @@ deg_to_clock <- function(x) {
             df$PlateLocHeight >= ZONE_BOTTOM & df$PlateLocHeight <= ZONE_TOP, 1.47,
           ifelse(
             df$PlateLocSide >= -1.5 & df$PlateLocSide <= 1.5 &
-              df$PlateLocHeight >= (2.65 - 1.5) & df$PlateLocHeight <= (2.65 + 1.5),
+              df$PlateLocHeight >= (((ZONE_BOTTOM + ZONE_TOP) / 2) - 1.5) & df$PlateLocHeight <= (((ZONE_BOTTOM + ZONE_TOP) / 2) + 1.5),
             0.73, 0
           )
         )
@@ -29291,6 +30669,7 @@ deg_to_clock <- function(x) {
         
         # Add Even/Ahead/Behind summary rows if splitting by Count
         count_state_rows <- NULL
+        state_one_one_rows <- list()
         if (split_choice == "Count" && "CountState" %in% names(df)) {
           for (state in c("Even", "Ahead", "Behind")) {
             state_df <- df %>% dplyr::filter(CountState == state)
@@ -30285,7 +31664,7 @@ deg_to_clock <- function(x) {
       showNotification("Please enter a name and choose at least one column.", type = "warning")
       return()
     }
-    scope <- if (isTRUE(is_admin()) && isTRUE(input$summaryCustomGlobal)) GLOBAL_SCOPE else current_school()
+    scope <- if (isTRUE(can_share_global()) && isTRUE(input$summaryCustomGlobal)) GLOBAL_SCOPE else current_school()
     ct <- custom_tables()
     ct[[nm]] <- list(cols = cols, school_code = scope)
     custom_tables(ct); save_custom_tables(ct); update_custom_table_choices(session)
@@ -30297,6 +31676,11 @@ deg_to_clock <- function(x) {
     if (!nzchar(nm)) return()
     ct <- custom_tables()
     if (nm %in% names(ct)) {
+      item_scope <- toupper(trimws(as.character(ct[[nm]]$school_code %||% current_school())))
+      if (identical(item_scope, GLOBAL_SCOPE) && !isTRUE(can_share_global())) {
+        showNotification("Only jgaynor@pitchingcoachu.com can delete global custom tables.", type = "error")
+        return()
+      }
       ct[[nm]] <- NULL
       custom_tables(ct); save_custom_tables(ct); update_custom_table_choices(session)
       updateSelectInput(session, "summaryCustomSaved", choices = c("", names(ct)), selected = "")
@@ -30320,7 +31704,7 @@ deg_to_clock <- function(x) {
       showNotification("Please enter a name and choose at least one column.", type = "warning")
       return()
     }
-    scope <- if (isTRUE(is_admin()) && isTRUE(input$dpCustomGlobal)) GLOBAL_SCOPE else current_school()
+    scope <- if (isTRUE(can_share_global()) && isTRUE(input$dpCustomGlobal)) GLOBAL_SCOPE else current_school()
     ct <- custom_tables()
     ct[[nm]] <- list(cols = cols, school_code = scope)
     custom_tables(ct); save_custom_tables(ct); update_custom_table_choices(session)
@@ -30332,6 +31716,11 @@ deg_to_clock <- function(x) {
     if (!nzchar(nm)) return()
     ct <- custom_tables()
     if (nm %in% names(ct)) {
+      item_scope <- toupper(trimws(as.character(ct[[nm]]$school_code %||% current_school())))
+      if (identical(item_scope, GLOBAL_SCOPE) && !isTRUE(can_share_global())) {
+        showNotification("Only jgaynor@pitchingcoachu.com can delete global custom tables.", type = "error")
+        return()
+      }
       ct[[nm]] <- NULL
       custom_tables(ct); save_custom_tables(ct); update_custom_table_choices(session)
       updateSelectInput(session, "dpCustomSaved", choices = c("", names(ct)), selected = "")
@@ -30365,10 +31754,13 @@ deg_to_clock <- function(x) {
       "Batter Hand" = "Batter Hand",
       "Count" = "Count",
       "After Count" = "After Count",
+      "Zone Location" = "Zone Location",
+      "Times Through Order" = "Times Through Order",
       "Velocity" = "Velocity",
       "IVB" = "InducedVert",
       "HB" = "HorzBreak",
       "Batter" = "Batter",
+      "Catcher" = "Catcher",
       "Pitch"  # default
     )
     
@@ -30469,7 +31861,7 @@ deg_to_clock <- function(x) {
           df$PlateLocHeight >= ZONE_BOTTOM & df$PlateLocHeight <= ZONE_TOP, 1.47,
         ifelse(
           df$PlateLocSide >= -1.5 & df$PlateLocSide <= 1.5 &
-            df$PlateLocHeight >= (2.65 - 1.5) & df$PlateLocHeight <= (2.65 + 1.5),
+            df$PlateLocHeight >= (((ZONE_BOTTOM + ZONE_TOP) / 2) - 1.5) & df$PlateLocHeight <= (((ZONE_BOTTOM + ZONE_TOP) / 2) + 1.5),
           0.73, 0
         )
       )
@@ -31616,15 +33008,15 @@ deg_to_clock <- function(x) {
   .abp_geom_zone <- function(color = "black") {
     home <- data.frame(x=c(-0.75,0.75,0.75,0.00,-0.75),
                        y=c(1.05, 1.05,1.15,1.25, 1.15)-0.5)
-    cz <- data.frame(xmin = -1.5, xmax = 1.5, ymin = 2.65 - 1.5, ymax = 2.65 + 1.5)
+    cz <- data.frame(xmin = -1.5, xmax = 1.5, ymin = ((ZONE_BOTTOM + ZONE_TOP) / 2) - 1.5, ymax = ((ZONE_BOTTOM + ZONE_TOP) / 2) + 1.5)
     sz <- data.frame(xmin = ZONE_LEFT, xmax = ZONE_RIGHT, ymin = ZONE_BOTTOM, ymax = ZONE_TOP)
-    list(
+    c(list(
       geom_polygon(data = home, aes(x, y), fill = NA, color = color),
       geom_rect(data = cz, aes(xmin = xmin, xmax = xmax, ymin = ymin, ymax = ymax),
                 fill = NA, color = color, linetype = "dashed"),
       geom_rect(data = sz, aes(xmin = xmin, xmax = xmax, ymin = ymin, ymax = ymax),
                 fill = NA, color = color)
-    )
+    ), zone_nine_square_layers(color = color))
   }
   
   # All game dates where the selected pitcher has ≥1 completed PA (across any batters)
@@ -33446,7 +34838,7 @@ deg_to_clock <- function(x) {
     
     home <- data.frame(x = c(-0.75, 0.75, 0.75, 0.00, -0.75),
                        y = c(1.05, 1.05, 1.15, 1.25, 1.15) - 0.5)
-    cz <- data.frame(xmin = -1.5, xmax = 1.5, ymin = 2.65 - 1.5, ymax = 2.65 + 1.5)
+    cz <- data.frame(xmin = -1.5, xmax = 1.5, ymin = ((ZONE_BOTTOM + ZONE_TOP) / 2) - 1.5, ymax = ((ZONE_BOTTOM + ZONE_TOP) / 2) + 1.5)
     sz <- data.frame(xmin = ZONE_LEFT, xmax = ZONE_RIGHT, ymin = ZONE_BOTTOM, ymax = ZONE_TOP)
     
     df_known <- dplyr::filter(df_i, !is.na(Result))
@@ -33458,6 +34850,7 @@ deg_to_clock <- function(x) {
                 fill = NA, color = line_col, linetype = "dashed", inherit.aes = FALSE) +
       geom_rect(data = sz, aes(xmin = xmin, xmax = xmax, ymin = ymin, ymax = ymax),
                 fill = NA, color = line_col, inherit.aes = FALSE) +
+      zone_nine_square_layers(color = line_col) +
       
       ggiraph::geom_point_interactive(
         data = df_other,
@@ -33633,7 +35026,7 @@ deg_to_clock <- function(x) {
     
     home <- data.frame(x=c(-0.75,0.75,0.75,0.00,-0.75),
                        y=c(1.05,1.05,1.15,1.25,1.15)-0.5)
-    cz <- data.frame(xmin = -1.5, xmax = 1.5, ymin = 2.65 - 1.5, ymax = 2.65 + 1.5)
+    cz <- data.frame(xmin = -1.5, xmax = 1.5, ymin = ((ZONE_BOTTOM + ZONE_TOP) / 2) - 1.5, ymax = ((ZONE_BOTTOM + ZONE_TOP) / 2) + 1.5)
     sz <- data.frame(xmin = ZONE_LEFT, xmax = ZONE_RIGHT, ymin = ZONE_BOTTOM, ymax = ZONE_TOP)
     
     p <- ggplot() +
@@ -33642,6 +35035,7 @@ deg_to_clock <- function(x) {
                 fill = NA, color = line_col, linetype = "dashed") +
       geom_rect(data = sz, aes(xmin=xmin,xmax=xmax,ymin=ymin,ymax=ymax),
                 fill = NA, color = line_col) +
+      zone_nine_square_layers(color = line_col) +
       
       # visible points (unknown result as solid circle)
       ggiraph::geom_point_interactive(
@@ -33829,7 +35223,7 @@ deg_to_clock <- function(x) {
     trend_plot(
       df,
       PlateLocSide >= -1.5 & PlateLocSide <= 1.5 &
-        PlateLocHeight >= (2.65 - 1.5) & PlateLocHeight <= (2.65 + 1.5),
+        PlateLocHeight >= (((ZONE_BOTTOM + ZONE_TOP) / 2) - 1.5) & PlateLocHeight <= (((ZONE_BOTTOM + ZONE_TOP) / 2) + 1.5),
       "Comp %", "Percentage",
       function(x) mean(x, na.rm = TRUE) * 100,
       digits = 1
@@ -33870,7 +35264,7 @@ deg_to_clock <- function(x) {
                           PlateLocHeight >= ZONE_BOTTOM & PlateLocHeight <= ZONE_TOP, 1.47,
                         ifelse(
                           PlateLocSide >= -1.5 & PlateLocSide <= 1.5 &
-                            PlateLocHeight >= (2.65 - 1.5) & PlateLocHeight <= (2.65 + 1.5),
+                            PlateLocHeight >= (((ZONE_BOTTOM + ZONE_TOP) / 2) - 1.5) & PlateLocHeight <= (((ZONE_BOTTOM + ZONE_TOP) / 2) + 1.5),
                           0.73, 0
                         )
                       ) * 100)
@@ -33899,7 +35293,7 @@ deg_to_clock <- function(x) {
             PlateLocHeight >= ZONE_BOTTOM & PlateLocHeight <= ZONE_TOP, 1.47,
           ifelse(
             PlateLocSide >= -1.5 & PlateLocSide <= 1.5 &
-              PlateLocHeight >= (2.65 - 1.5) & PlateLocHeight <= (2.65 + 1.5),
+              PlateLocHeight >= (((ZONE_BOTTOM + ZONE_TOP) / 2) - 1.5) & PlateLocHeight <= (((ZONE_BOTTOM + ZONE_TOP) / 2) + 1.5),
             0.73, 0
           )
         ) * 100
@@ -33946,7 +35340,7 @@ deg_to_clock <- function(x) {
                           PlateLocHeight >= ZONE_BOTTOM & PlateLocHeight <= ZONE_TOP, 1.47,
                         ifelse(
                           PlateLocSide >= -1.5 & PlateLocSide <= 1.5 &
-                            PlateLocHeight >= (2.65 - 1.5) & PlateLocHeight <= (2.65 + 1.5),
+                            PlateLocHeight >= (((ZONE_BOTTOM + ZONE_TOP) / 2) - 1.5) & PlateLocHeight <= (((ZONE_BOTTOM + ZONE_TOP) / 2) + 1.5),
                           0.73, 0
                         )
                       ) * 100)
@@ -34555,7 +35949,7 @@ deg_to_clock <- function(x) {
         1.47,  # Strike zone score
         ifelse(
           data$PlateLocSide >= -1.5 & data$PlateLocSide <= 1.5 &
-            data$PlateLocHeight >= (2.65 - 1.5) & data$PlateLocHeight <= (2.65 + 1.5),
+            data$PlateLocHeight >= (((ZONE_BOTTOM + ZONE_TOP) / 2) - 1.5) & data$PlateLocHeight <= (((ZONE_BOTTOM + ZONE_TOP) / 2) + 1.5),
           0.73,   # Competitive zone score
           0       # Outside competitive zone
         )
@@ -34620,7 +36014,7 @@ deg_to_clock <- function(x) {
         `Comp%` = as.numeric(ifelse(
           !is.na(PlateLocSide) & !is.na(PlateLocHeight) &
             PlateLocSide >= -1.5 & PlateLocSide <= 1.5 &
-            PlateLocHeight >= (2.65 - 1.5) & PlateLocHeight <= (2.65 + 1.5),
+            PlateLocHeight >= (((ZONE_BOTTOM + ZONE_TOP) / 2) - 1.5) & PlateLocHeight <= (((ZONE_BOTTOM + ZONE_TOP) / 2) + 1.5),
           100, 0
         )),
         `Strike%` = as.numeric(ifelse(
@@ -34813,7 +36207,7 @@ deg_to_clock <- function(x) {
             valid_locations <- sum(!is.na(PlateLocSide) & !is.na(PlateLocHeight), na.rm = TRUE)
             in_comp <- sum(!is.na(PlateLocSide) & !is.na(PlateLocHeight) &
                              PlateLocSide >= -1.5 & PlateLocSide <= 1.5 &
-                             PlateLocHeight >= (2.65 - 1.5) & PlateLocHeight <= (2.65 + 1.5), na.rm = TRUE)
+                             PlateLocHeight >= (((ZONE_BOTTOM + ZONE_TOP) / 2) - 1.5) & PlateLocHeight <= (((ZONE_BOTTOM + ZONE_TOP) / 2) + 1.5), na.rm = TRUE)
             if (valid_locations > 0) (in_comp / valid_locations) * 100 else NA_real_
           },
           `CSW%` = {
@@ -36280,7 +37674,7 @@ deg_to_clock <- function(x) {
     types_chr <- intersect(names(cols), unique(df$TaggedPitchType))
     home <- data.frame(x = c(-0.75, 0.75, 0.75, 0.00, -0.75),
                        y = c(1.05, 1.05, 1.15, 1.25, 1.15) - 0.5)
-    cz <- data.frame(xmin = -1.5, xmax = 1.5, ymin = 2.65 - 1.5, ymax = 2.65 + 1.5)
+    cz <- data.frame(xmin = -1.5, xmax = 1.5, ymin = ((ZONE_BOTTOM + ZONE_TOP) / 2) - 1.5, ymax = ((ZONE_BOTTOM + ZONE_TOP) / 2) + 1.5)
     sz <- data.frame(xmin = ZONE_LEFT, xmax = ZONE_RIGHT, ymin = ZONE_BOTTOM, ymax = ZONE_TOP)
     df_known <- dplyr::filter(df, !is.na(Result))
     df_other <- dplyr::filter(df,  is.na(Result))
@@ -36291,6 +37685,7 @@ deg_to_clock <- function(x) {
                 fill = NA, color = line_col, linetype = "dashed", inherit.aes = FALSE) +
       geom_rect(data = sz, aes(xmin = xmin, xmax = xmax, ymin = ymin, ymax = ymax),
                 fill = NA, color = line_col, inherit.aes = FALSE) +
+      zone_nine_square_layers(color = line_col) +
       
       ggiraph::geom_point_interactive(
         data = df_other,
@@ -37408,5 +38803,8 @@ deg_to_clock <- function(x) {
   custom_reports_server("creports")
 }
 # ---------- Run ----------
-shinyApp(ui=ui, server=server)# app.R
+log_startup_timing("Registering shiny app object")
+app <- shinyApp(ui = ui, server = server) # app.R
+log_startup_timing("Shiny app object ready")
+app
 # Shiny pitching report with per-player privacy + admin view + customized Stuff+ metric per pitch type
