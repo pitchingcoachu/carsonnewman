@@ -14,8 +14,8 @@ source("pitch_data_service.R")
 
 `%||%` <- function(a, b) if (is.null(a) || length(a) == 0 || all(is.na(a))) b else a
 
-team_code <- toupper(trimws(Sys.getenv("TEAM_CODE", "OSU")))
-if (!nzchar(team_code)) team_code <- "OSU"
+team_code <- toupper(trimws(Sys.getenv("TEAM_CODE", "CNU")))
+if (!nzchar(team_code)) team_code <- "CNU"
 
 cloud_name <- Sys.getenv("CLOUDINARY_CLOUD_NAME", "")
 api_key <- Sys.getenv("CLOUDINARY_API_KEY", "")
