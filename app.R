@@ -37105,9 +37105,18 @@ deg_to_clock <- function(x) {
     }
     
     req(input$movementPlot_selected)
-    selected_ids <- as.numeric(input$movementPlot_selected)
+    selected_ids <- suppressWarnings(as.integer(input$movementPlot_selected))
     df <- filtered_data()
     if (!nrow(df) || !length(selected_ids)) return()
+    selected_ids <- selected_ids[is.finite(selected_ids) & !is.na(selected_ids)]
+    selected_ids <- unique(selected_ids[selected_ids >= 1 & selected_ids <= nrow(df)])
+    if (!length(selected_ids)) {
+      showNotification(
+        "Select one or more individual pitch points to edit.",
+        type = "warning", duration = 4
+      )
+      return()
+    }
     
     # Get selected pitches
     selected_pitches <- df[selected_ids, ]
@@ -37469,9 +37478,18 @@ deg_to_clock <- function(x) {
     }
     
     req(input$summary_movementPlot_selected)
-    selected_ids <- as.numeric(input$summary_movementPlot_selected)
+    selected_ids <- suppressWarnings(as.integer(input$summary_movementPlot_selected))
     df <- filtered_data()
     if (!nrow(df) || !length(selected_ids)) return()
+    selected_ids <- selected_ids[is.finite(selected_ids) & !is.na(selected_ids)]
+    selected_ids <- unique(selected_ids[selected_ids >= 1 & selected_ids <= nrow(df)])
+    if (!length(selected_ids)) {
+      showNotification(
+        "Select one or more individual pitch points to edit.",
+        type = "warning", duration = 4
+      )
+      return()
+    }
     
     # Get selected pitches
     selected_pitches <- df[selected_ids, ]
