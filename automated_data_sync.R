@@ -27,8 +27,8 @@ FTP_USERPWD <- paste0(FTP_USER, ":", FTP_PASS)
 LOCAL_DATA_DIR      <- "data/"
 LOCAL_PRACTICE_DIR  <- file.path(LOCAL_DATA_DIR, "practice")
 LOCAL_V3_DIR        <- file.path(LOCAL_DATA_DIR, "v3")
-SYNC_START_YEAR <- suppressWarnings(as.integer(Sys.getenv("TM_SYNC_START_YEAR", "2024")))
-if (is.na(SYNC_START_YEAR) || SYNC_START_YEAR < 2000) SYNC_START_YEAR <- 2024
+SYNC_START_YEAR <- suppressWarnings(as.integer(Sys.getenv("TM_SYNC_START_YEAR", "2026")))
+if (is.na(SYNC_START_YEAR) || SYNC_START_YEAR < 2000) SYNC_START_YEAR <- 2026
 LAST_SYNC_FILE <- file.path(LOCAL_DATA_DIR, "last_sync.txt")
 TM_SYNC_LOOKBACK_DAYS <- suppressWarnings(as.integer(Sys.getenv("TM_SYNC_LOOKBACK_DAYS", "1")))
 if (is.na(TM_SYNC_LOOKBACK_DAYS) || TM_SYNC_LOOKBACK_DAYS < 1L) TM_SYNC_LOOKBACK_DAYS <- 1L
