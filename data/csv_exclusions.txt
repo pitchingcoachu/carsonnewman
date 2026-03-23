@@ -7120,3 +7120,25 @@
 20260301-WarriorField-1_unverified.csv
 # Auto-pruned non-team data
 20260301-WoernerField-1_unverified.csv
+# Auto-pruned non-team data
+20260227-BaumStadium-1_unverified.csv
+# Auto-pruned non-team data
+20260227-HuskyField-2_unverified.csv
+# Auto-pruned non-team data
+20260227-TuckerFieldatBarcroftPark-1_unverified.csv
+# Auto-pruned non-team data
+20260227-DicksonStadium-1.csv
+# Auto-pruned non-team data
+20260227-FriersonField-1.csv
+# Auto-pruned non-team data
+20260227-GaryWright-1.csv
+# Auto-pruned non-team data
+20260227-IrwinField-1.csv
+# Auto-pruned non-team data
+20260227-ReinhardtUniversity-1_unverified.csv
+# Auto-pruned non-team data
+20260227-RodenField-1.csv
+# Auto-pruned non-team data
+20260227-RonChrisStad-1.csv
+# Auto-pruned non-team data
+20260227-SouthernWesleyan-1.csv
